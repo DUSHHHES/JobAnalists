@@ -1,66 +1,83 @@
 import sqlite3
 import json
 import ollama
-import re
+import sys
 
 DB_NAME = "habr_analytics.db"
 
 
 def init_ai_columns():
-    """Добавляем новые колонки, включая ИИ-грейд."""
+    """Добавляем новые колонки в базу, если их еще нет."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    try:
-        cursor.execute("ALTER TABLE vacancies ADD COLUMN requirements_density INTEGER")
-    except sqlite3.OperationalError:
-        pass
 
-    try:
-        cursor.execute("ALTER TABLE vacancies ADD COLUMN sentiment_score INTEGER")
-    except sqlite3.OperationalError:
-        pass
+    # Добавляем колонки по одной (try/except защищает, если они уже созданы)
+    columns = [
+        ("requirements_density", "INTEGER"),
+        ("sentiment_score", "INTEGER"),
+        ("ai_grade", "TEXT")  # Сюда будем писать строгий текст 'Junior', 'Middle', 'Senior'
+    ]
 
-    try:
-        cursor.execute("ALTER TABLE vacancies ADD COLUMN ai_grade TEXT")
-    except sqlite3.OperationalError:
-        pass
+    for col_name, col_type in columns:
+        try:
+            cursor.execute(f"ALTER TABLE vacancies ADD COLUMN {col_name} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # Колонка уже существует
 
     conn.commit()
     conn.close()
 
 
-def analyze_vacancy_with_ai(description):
-    """Отправляет текст в Ollama и получает 3 метрики (включая грейд)."""
+def analyze_vacancy_with_ai(title, description):
+    """
+    Отправляет вакансию в Ollama.
+    Использует цифры 1, 2, 3 для грейдов, чтобы избежать проблем с токенами ИИ.
+    """
     system_prompt = (
-        "Ты — опытный IT-рекрутер. Проанализируй текст вакансии и верни СТРОГО один валидный JSON-словарь с тремя ключами.\n"
-        "1. requirements_density: Плотность требований (от 1 до 10).\n"
-        "2. sentiment_score: Готовность обучать (от 1 до 10).\n"
-        "3. grade: На основе текста определи уровень кандидата. Выбери СТРОГО одно из трех слов: Junior, Middle, Senior.\n\n"
-        "Пример ответа:\n"
-        '{"requirements_density": 5, "sentiment_score": 8, "grade": "Middle"}'
+        "You are an IT Recruiter API. Analyze the job description and return ONLY a valid JSON object.\n"
+        "Keys to return:\n"
+        "1. 'density': Requirements complexity (integer from 1 to 10).\n"
+        "2. 'sentiment': Company's willingness to mentor/train (integer from 1 to 10).\n"
+        "3. 'grade_code': Candidate level. Return ONLY integer: 1 for Junior, 2 for Middle, 3 for Senior.\n\n"
+        "Example output:\n"
+        '{"density": 5, "sentiment": 8, "grade_code": 2}'
     )
+
+    user_content = f"Job Title: {title}\nDescription:\n{description}"
 
     try:
         response = ollama.chat(
             model='llama3',
             messages=[
                 {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': f"Текст вакансии:\n{description}"}
+                {'role': 'user', 'content': user_content}
             ],
-            format='json',  # Запрещаем ИИ писать лишний текст
+            format='json',
             options={'temperature': 0.0}
         )
 
-        result_text = response['message']['content'].strip()
-        data = json.loads(result_text)
+        raw_json = response['message']['content'].strip()
+        data = json.loads(raw_json)
 
-        grade = data.get("grade", "Middle")
-        if grade not in ["Junior", "Middle", "Senior"]:
-            grade = "Middle"
+        # Строгая валидация полей из JSON
+        density = int(data['density'])
+        sentiment = int(data['sentiment'])
+        grade_code = int(data['grade_code'])
 
-        return data.get("requirements_density", 5), data.get("sentiment_score", 5), grade
-    except Exception as e:
-        return 5, 5, "Middle"  # Дефолт при ошибке
+        # Проверяем диапазоны, чтобы ИИ не выдал "15 из 10"
+        if not (1 <= density <= 10) or not (1 <= sentiment <= 10):
+            raise ValueError("Метрики вышли за пределы диапазона 1-10")
+
+        # Мапим цифровые коды обратно в понятные сайту строки
+        grade_map = {1: "Junior", 2: "Middle", 3: "Senior"}
+        grade_str = grade_map.get(grade_code, "Middle")
+
+        return density, sentiment, grade_str
+
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        # Не жрем ошибку молча, а возвращаем None, чтобы забраковать запись
+        print(f"⚠️ Ошибка парсинга ИИ для '{title}': {e}", file=sys.stderr)
+        return None
 
 
 def enrich_data():
@@ -69,33 +86,55 @@ def enrich_data():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    # Ищем все вакансии, где ИИ еще не проставил свой грейд
+    # Вытаскиваем записи, где разметка еще не проводилась
     cursor.execute("SELECT id, title, description FROM vacancies WHERE ai_grade IS NULL")
     vacancies = cursor.fetchall()
 
     if not vacancies:
-        print("✅ Все вакансии уже размечены ИИ!")
+        print("✅ Все вакансии в базе уже успешно обработаны ИИ!")
         conn.close()
         return
 
-    print(f"🤖 Начинаю глубокий ИИ-анализ вакансий (осталось: {len(vacancies)})...")
+    print(f"🤖 Начинаю пакетный ИИ-анализ вакансий. Всего к обработке: {len(vacancies)}")
+
+    # Кэш в оперативной памяти для пакетной вставки
+    db_update_cache = []
+    broken_records_count = 0
 
     for idx, (v_id, title, desc) in enumerate(vacancies, 1):
+        # Критика друга: Бракуем записи без описания сразу, они срут в статистику
+        if not desc or len(desc.strip()) < 10:
+            print(f"[{idx}/{len(vacancies)}] ❌ Забраковано (нет описания): {title}")
+            # Помечаем в базе как ERROR, чтобы скрипт не мучал её при следующем запуске
+            db_update_cache.append((-1, -1, "ERROR", v_id))
+            broken_records_count += 1
+            continue
+
         print(f"[{idx}/{len(vacancies)}] Llama 3 анализирует: {title}")
 
-        if not desc:
-            density, sentiment, grade = 5, 5, "Middle"
-        else:
-            density, sentiment, grade = analyze_vacancy_with_ai(desc)
+        ai_result = analyze_vacancy_with_ai(title, desc)
 
-        cursor.execute(
+        if ai_result is None:
+            # Если ИИ прислал битый JSON — бракуем запись, пишем ERROR
+            db_update_cache.append((-1, -1, "ERROR", v_id))
+            broken_records_count += 1
+        else:
+            density, sentiment, grade_str = ai_result
+            # Складываем данные в кэш
+            db_update_cache.append((density, sentiment, grade_str, v_id))
+
+    # Критика друга: Пушим все данные в БД ОДНИМ ПАКЕТОМ (транзакцией)
+    if db_update_cache:
+        print(f"\n📦 Записываю пакет из {len(db_update_cache)} обновлений в базу данных...")
+        cursor.executemany(
             "UPDATE vacancies SET requirements_density = ?, sentiment_score = ?, ai_grade = ? WHERE id = ?",
-            (density, sentiment, grade, v_id)
+            db_update_cache
         )
         conn.commit()
 
     conn.close()
-    print("\n🎉 Разметка завершена! ИИ определил грейды для всех вакансий.")
+    print(
+        f"🎉 Разметка завершена! Успешно обработано: {len(db_update_cache) - broken_records_count}, забраковано: {broken_records_count}")
 
 
 if __name__ == "__main__":

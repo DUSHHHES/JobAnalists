@@ -1,66 +1,113 @@
 import sqlite3
 import json
-import ollama
-import os
 import re
+import collections
+from rapidfuzz import process, fuzz
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import SnowballStemmer
+
+# Скачиваем список стоп-слов (предлоги, союзы, которые нужно выкинуть)
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
 
 DB_NAME = "habr_analytics.db"
 
+# Стеммеры для очистки окончаний и букв Е/Ё
+stemmer_ru = SnowballStemmer("russian")
+stemmer_en = SnowballStemmer("english")
 
-def generate_dynamic_map():
+
+def clean_and_stem(word):
+    """Приводит слово к морфологической основе и нижнему регистру."""
+    word = word.lower().replace('ё', 'е')
+    # Если слово английское
+    if re.match(r'[a-z]', word):
+        return stemmer_en.stem(word)
+    # Если русское
+    elif re.match(r'[а-я]', word):
+        return stemmer_ru.stem(word)
+    return word
+
+
+def build_smart_categories():
+    print("📦 Извлекаю данные из базы для контекстного анализа...")
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT title FROM vacancies")
-    unique_titles = [row[0] for row in cursor.fetchall()]
+    # Берем только валидные вакансии
+    cursor.execute("SELECT title, description FROM vacancies WHERE ai_grade != 'ERROR' AND description IS NOT NULL")
+    rows = cursor.fetchall()
     conn.close()
 
-    print(f"📦 Всего уникальных вакансий: {len(unique_titles)}")
+    if not rows:
+        print("❌ Нет валидных данных для анализа! Сначала запусти парсер и ai_enricher.py.")
+        return
 
-    # Разбиваем список на порции по 50 штук
-    batch_size = 50
-    final_data = {}
+    # Наш жесткий эталонный список корневых ИТ-направлений
+    core_categories = ["Python", "C++", "Go", "Java", "C#", "JavaScript", "Frontend", "DevOps", "QA"]
 
-    for i in range(0, len(unique_titles), batch_size):
-        batch = unique_titles[i:i + batch_size]
-        print(f"🤖 Анализирую порцию {i // batch_size + 1}...")
+    # Сюда будем собирать синонимы для каждой категории
+    # Изначально закидываем базовые паттерны
+    synonyms_map = {
+        "Python": ["python", "питон"],
+        "C++": ["c++", "cpp", "плюс", "c/c++"],
+        "Go": ["go", "golang"],
+        "Java": ["java", "джава"],
+        "C#": ["c#", "шарп", ".net"],
+        "JavaScript": ["javascript", "js", "typescript", "ts"],
+        "Frontend": ["frontend", "фронтенд", "react", "vue", "angular"],
+        "DevOps": ["devops", "девопс", "sre", "infra", "sysadmin", "администратор"],
+        "QA": ["qa", "тестировщик", "test", "testing", "manual", "automation"]
+    }
 
-        system_prompt = (
-            "You are a strict data formatting API. "
-            "Group the provided job titles into IT categories. "
-            "Respond ONLY with a valid JSON object: {\"CategoryName\": \"regex|pattern\"}."
-        )
+    print("🧠 Запускаю Левенштейна и Стемминг для анализа заголовков вакансий...")
 
-        try:
-            response = ollama.chat(
-                model='llama3',
-                messages=[
-                    {'role': 'system', 'content': system_prompt},
-                    {'role': 'user', 'content': "\n".join(batch)}
-                ],
-                format='json',
-                options={'temperature': 0.0}
-            )
+    # Проходим по всем реальным названиям вакансий из базы
+    for title, desc in rows:
+        title_clean = title.lower().replace('ё', 'е')
 
-            chunk_data = json.loads(response['message']['content'])
+        # Токенизируем заголовок на отдельные слова
+        words = re.findall(r'[a-zA-Zа-яА-Я#\++\.]+', title_clean)
 
-            # Объединяем результаты в один словарь
-            if isinstance(chunk_data, dict):
-                final_data.update(chunk_data)
-            elif isinstance(chunk_data, list):
-                # Если ИИ опять начал делать списки, простейшая попытка слияния
-                for item in chunk_data:
-                    if isinstance(item, dict):
-                        final_data.update(item)
+        for word in words:
+            if len(word) < 2:
+                continue
 
-        except Exception as e:
-            print(f"⚠️ Ошибка на порции {i}: {e}. Пропускаем...")
+            # Для каждого слова из заголовка ищем, к какому ИТ-направлению оно ближе всего математически
+            for category, syn_list in synonyms_map.items():
+                # RapidFuzz ищет наилучшее совпадение слова со списком синонимов категории
+                best_match = process.extractOne(word, syn_list, scorer=fuzz.WRatio)
 
-    # Сохраняем итоговый JSON
+                if best_match:
+                    match_text, score, _ = best_match
+                    # Если совпадение символов выше 85% — это синоним! (поймает опечатки)
+                    if score >= 85 and word not in syn_list:
+                        synonyms_map[category].append(word)
+
+    # Превращаем списки синонимов в строгие regex-паттерны для app.py
+    final_categories_map = {}
+    for category, syn_list in synonyms_map.items():
+        # Убираем дубликаты синонимов, если они возникли
+        unique_syns = list(set(syn_list))
+
+        # Формируем паттерн. Если это короткое слово вроде Go, защищаем его границами слова \\b
+        processed_syns = []
+        for s in unique_syns:
+            if s.lower() == 'go' or s.lower() == 'qa':
+                processed_syns.append(f"\\b{re.escape(s)}\\b")
+            else:
+                processed_syns.append(re.escape(s))
+
+        final_categories_map[category] = "|".join(processed_syns)
+
+    # Сохраняем математически точный JSON
     with open("dynamic_categories.json", "w", encoding="utf-8") as f:
-        json.dump(final_data, f, ensure_ascii=False, indent=4)
+        json.dump(final_categories_map, f, ensure_ascii=False, indent=4)
 
-    print(f"✅ Успех! Категории ИИ сохранены: {list(final_data.keys())}")
+    print(f"✅ Успех! Алгоритмы Левенштейна сформировали карту: {list(final_categories_map.keys())}")
 
 
 if __name__ == "__main__":
-    generate_dynamic_map()
+    build_smart_categories()

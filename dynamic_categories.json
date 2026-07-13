@@ -1,0 +1,11 @@
+{
+    "Python": "руководитель|ит|питон|нагрузочному|декретная|надежности|анализу|проектная|на|архитектор|python|юнита|функциональный|аналитик|развитию",
+    "C++": "плюс|c\\+\\+|cpp|c/c\\+\\+",
+    "Go": "gonka|golаng|golang|\\bgo\\b|django",
+    "Java": "java|джава|javascript",
+    "C#": "network|net|c\\#|c\\#\\+|шарп|\\.net|c\\#\\+vue\\.js",
+    "JavaScript": "js|java|payments|vue\\.js|framework|me|typescript|ts|javascript|time|c\\#\\+vue\\.js",
+    "Frontend": "frontend|фронтенд|angular|vue\\.js|vue|c\\#\\+vue\\.js|react",
+    "DevOps": "infrastructure|девопс|in|sre|infra|devops|testing|uc|integration|engineer|sysadmin|администратор",
+    "QA": "automation|testing|integration|aqa|engineer|тестировщик|auto|\\bqa\\b|manual|in|test"
+}
