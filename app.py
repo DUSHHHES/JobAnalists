@@ -1,3 +1,4 @@
+import numpy as np
 import os
 import sqlite3
 import pandas as pd
@@ -164,6 +165,37 @@ if not df.empty:
         k_demand = min(max(round(raw_score / 3, 1), 1.0), 10.0)
     else:
         k_demand = 1.0
+
+    # 1. Группируем данные из БД по грейдам
+    df_grade = df.groupby('ai_grade').agg(
+        n_count=('sentiment_score', 'count'),
+
+        # Средние значения (твои 6.5 - 7.5)
+        avg_sentiment=('sentiment_score', 'mean'),
+        avg_density=('requirements_density', 'mean'),
+
+        # 🕵️‍♂️ А вот это покажет экстремумы:
+        min_sentiment=('sentiment_score', 'min'),
+        max_sentiment=('sentiment_score', 'max')
+    ).reset_index()
+
+    # 2. Находим максимальное количество вакансий среди всех грейдов
+    max_vacancies = df_grade['n_count'].max()
+
+    # 3. НАША НОВАЯ НАУЧНО-ВЗВЕШЕННАЯ ФОРМУЛА
+    # Считаем логарифмы для сглаживания объемов рынка
+    log_n = np.log(df_grade['n_count'] + 1)
+    log_max = np.log(max_vacancies + 1)
+
+    # Применяем формулу с весами (0.4, 0.4, 0.2)
+    df_grade['w_score'] = (
+    (log_n / log_max) * 0.4 +  # Взвешенный объем рынка
+    (df_grade['avg_sentiment'] / 10) * 0.4 +  # Оценка лояльности
+    (1 - df_grade['avg_density'] / 10) * 0.2  # Инверсия жесткости требований
+     ) * 100
+
+    # Округляем до двух знаков после запятой для красоты
+    df_grade['w_score'] = df_grade['w_score'].round(2)
 
     # --- ИНТЕРФЕЙС ДАШБОРДА ---
     st.title(f"📊 Анализ востребованности: {selected_tech} ({selected_grade})")
