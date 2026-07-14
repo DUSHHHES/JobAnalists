@@ -1,296 +1,486 @@
-import numpy as np
-import os
 import sqlite3
+import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
-import json
-import re
+import plotly.express as px
+from collections import Counter
 
-st.set_page_config(page_title="Job Market Analytics", page_icon="📊", layout="wide")
+# --------------------------------------------------------
+# НАСТРОЙКИ СТРАНИЦЫ
+# --------------------------------------------------------
 
+st.set_page_config(
+    page_title="Аналитика IT-рынка",
+    page_icon="📊",
+    layout="wide"
+)
 
-@st.cache_data(ttl=60)  # Критика друга: добавили кэширование, чтобы не "дрочить" БД постоянно!
+st.title("📊 Анализ востребованности IT-специалистов")
+
+st.markdown("""
+Дашборд рассчитывает **интегральный коэффициент востребованности**
+на основе данных вакансий Хабр Карьеры и результатов анализа Google Gemini.
+
+Используемая модель расчета сырого веса:
+**K_raw = 0.35·N + 0.25·S + 0.20·D + 0.05·G − 0.15·C**
+
+Итоговый индекс масштабируется относительно рынка (от 0 до 100):
+**K_score = (K_raw - min_k) / (max_k - min_k) * 100**
+""")
+
+# --------------------------------------------------------
+# ЗАГРУЗКА ДАННЫХ
+# --------------------------------------------------------
+
+@st.cache_data(ttl=600)  # Кешируем данные на 10 минут
 def load_data():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    if " .venv" in current_dir or "venv" in current_dir:
-        base_dir = os.path.dirname(current_dir)
-    else:
-        base_dir = current_dir
+    conn = sqlite3.connect("habr_analytics.db")
 
-    db_path = os.path.join(base_dir, "habr_analytics.db")
-
-    if not os.path.exists(db_path):
-        st.error(f"❌ База данных не найдена по пути: {db_path}")
-        return pd.DataFrame(), 0
-
-    conn = sqlite3.connect(db_path)
-
-    # Считаем абсолютно все записи в базе для истории
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM vacancies")
-    raw_total_count = cursor.fetchone()[0]
-
-    # Загружаем только те записи, которые ИИ НЕ ЗАБРАКОВАЛ (где нет статуса ERROR)
     query = """
-        SELECT title, experience, description, requirements_density, sentiment_score, ai_grade 
-        FROM vacancies 
-        WHERE ai_grade IS NOT NULL AND ai_grade != 'ERROR'
+    SELECT
+        title,
+        company,
+        salary,
+        skills,
+        description,
+        link,
+        salary_score,
+        competition_score,
+        requirements_density,
+        sentiment_score,
+        ai_grade
+    FROM vacancies
+    WHERE
+        ai_grade IN ('Junior','Middle','Senior')
+        AND requirements_density IS NOT NULL
     """
-    df = pd.read_sql_query(query, conn)
+
+    df = pd.read_sql(query, conn)
     conn.close()
 
-    return df, raw_total_count
+    return df
 
 
-# --- Загрузка данных ---
-df, total_scraped_vacancies = load_data()
+df = load_data()
 
-if not df.empty:
-    # Используем грейд от ИИ (теперь он железно Junior, Middle или Senior)
-    df["grade"] = df["ai_grade"]
-
-    # Посчитаем, сколько всего валидных вакансий прошло очистку ИИ
-    total_valid_vacancies = len(df)
-    broken_vacancies_count = total_scraped_vacancies - total_valid_vacancies
-
-    # === ИИ-АВТОМАТИЗАЦИЯ СПИСКА ПРОФЕССИЙ ===
-    json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dynamic_categories.json")
-
-    categories_map = {}
-    if os.path.exists(json_path):
-        with open(json_path, "r", encoding="utf-8") as f:
-            raw_data = json.load(f)
-
-        while isinstance(raw_data, dict) and len(raw_data) == 1:
-            first_key = list(raw_data.keys())[0]
-            if isinstance(raw_data[first_key], (dict, list)):
-                raw_data = raw_data[first_key]
-            else:
-                break
-
-        if isinstance(raw_data, list):
-            for item in raw_data:
-                if isinstance(item, dict):
-                    cat_name = None
-                    cat_values = []
-                    for k, v in item.items():
-                        if isinstance(v, str):
-                            cat_name = v
-                        elif isinstance(v, (list, dict)):
-                            cat_values = v
-                    if cat_name:
-                        categories_map[cat_name] = cat_values
-                    else:
-                        categories_map.update(item)
-        elif isinstance(raw_data, dict):
-            categories_map = raw_data
-
-    if not categories_map:
-        categories_map = {
-            "Python": r"python|питон",
-            "C++": r"c\+\+|cpp|плюс|c/c\+\+",
-            "Go": r"\bgo\b|golang"
-        }
+if df.empty:
+    st.error("В базе нет размеченных вакансий.")
+    st.stop()
 
 
-    def extract_regex_pattern(obj):
-        if isinstance(obj, str):
-            if "|" not in obj and not obj.startswith("\\b"):
-                return re.escape(obj)
-            return obj
-        elif isinstance(obj, list):
-            strings = [extract_regex_pattern(item) for item in obj]
-            return "|".join([s for s in strings if s])
-        elif isinstance(obj, dict):
-            strings = [extract_regex_pattern(val) for val in obj.values()]
-            return "|".join([s for s in strings if s])
-        else:
-            return re.escape(str(obj))
+# --------------------------------------------------------
+# ОПРЕДЕЛЕНИЕ ТЕХНОЛОГИИ
+# --------------------------------------------------------
+
+def detect_technology(title: str):
+    title = str(title).lower()
+
+    patterns = {
+        "Python": ["python"],
+        "Java": [" java ", "java developer", "java-разработчик"],
+        "JavaScript": ["javascript", "js developer", "frontend", "фронтенд"],
+        "TypeScript": ["typescript"],
+        "Go": [" golang", "go developer", "go-разработчик"],
+        "C#": ["c#", ".net", "asp.net"],
+        "C++": ["c++"],
+        "PHP": ["php"],
+        "Kotlin": ["kotlin"],
+        "Swift": ["swift"],
+        "Rust": ["rust"],
+        "Scala": ["scala"],
+        "Ruby": ["ruby"],
+        "Dart": ["dart", "flutter"],
+        "1C": ["1с", "1c"],
+        "DevOps": ["devops", "sre"],
+        "QA": [" qa ", "qa engineer", "tester", "тестировщик", "qa-инженер"],
+        "Data Scientist": ["data scientist", "data science"],
+        "ML": ["machine learning", "ml engineer", " ml "],
+        "Android": ["android"],
+        "iOS": ["ios"]
+    }
+
+    for tech, words in patterns.items():
+        for word in words:
+            if word.lower() in title:
+                return tech
+
+    return "Other"
 
 
-    existing_techs = []
+df["technology"] = df["title"].apply(detect_technology)
 
-    for tech, raw_pattern in categories_map.items():
-        clean_pattern = extract_regex_pattern(raw_pattern)
-        if not clean_pattern:
-            continue
-        try:
-            has_vacancies = df["title"].str.contains(clean_pattern, case=False, regex=True).any()
-            if has_vacancies:
-                existing_techs.append(tech)
-        except Exception:
-            pass
+# --------------------------------------------------------
+# ГЛОБАЛЬНЫЙ РАСЧЕТ И НОРМАЛИЗАЦИЯ (ДЛЯ ВСЕГО РЫНКА)
+# --------------------------------------------------------
+# Чтобы найти min и max, мы должны сначала просчитать k_raw для всех комбинаций
+grade_map = {"Junior": 1, "Middle": 2, "Senior": 3}
+df['grade_num'] = df['ai_grade'].map(grade_map)
 
-    if not existing_techs:
-        existing_techs = list(categories_map.keys())
+# Агрегируем все данные глобально
+global_stats = df.groupby(['technology', 'ai_grade']).agg(
+    count=('title', 'count'),
+    avg_salary=('salary_score', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
+    avg_density=('requirements_density', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
+    avg_comp=('competition_score', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
+    grade_num=('grade_num', 'first')
+).reset_index()
 
-    # --- Боковая панель ---
-    st.sidebar.header("⚙️ Настройки анализа")
-    selected_tech = st.sidebar.selectbox("Выбери технологию/стек:", existing_techs)
-    selected_grade = st.sidebar.radio("Выбери грейд соискателя:", ["Junior", "Middle", "Senior"])
+max_count = global_stats['count'].max()
 
-    # Выводим в боковую панель честную ИИ-статистику по очистке данных
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("📊 Состояние датасета")
-    st.sidebar.write(f"• Всего спарсено: **{total_scraped_vacancies}**")
-    st.sidebar.write(f"• Валидных (ИИ): **{total_valid_vacancies}**")
-    if broken_vacancies_count > 0:
-        st.sidebar.error(f"• Отбраковано мусора: **{broken_vacancies_count}**")
+# Нормированные переменные для формулы
+global_stats['Nn'] = np.log(global_stats['count'] + 1) / np.log(max_count + 1)
+global_stats['Sn'] = global_stats['avg_salary'] / 10
+global_stats['Dn'] = global_stats['avg_density'] / 10
+global_stats['Gn'] = global_stats['grade_num'] / 3
+global_stats['Cn'] = global_stats['avg_comp'] / 10
 
-    # === ТОЧНАЯ ФИЛЬТРAЦИЯ ДЛЯ ВЫБРАННОГО ЯЗЫКА ===
-    raw_selected_pattern = categories_map.get(selected_tech, selected_tech.lower())
-    clean_selected_pattern = extract_regex_pattern(raw_selected_pattern)
+# Считаем сырой коэффициент K_raw для всех комбинаций
+global_stats['k_raw'] = (
+    0.35 * global_stats['Nn'] +
+    0.25 * global_stats['Sn'] +
+    0.20 * global_stats['Dn'] +
+    0.05 * global_stats['Gn'] -
+    0.15 * global_stats['Cn']
+)
 
-    try:
-        tech_mask = df["title"].str.contains(clean_selected_pattern, case=False, regex=True)
-    except:
-        tech_mask = df["title"].str.contains(re.escape(selected_tech.lower()), case=False)
+# Находим глобальные минимумы и максимумы
+min_k = global_stats['k_raw'].min()
+max_k = global_stats['k_raw'].max()
 
-    df_filtered = df[tech_mask & (df["grade"] == selected_grade)]
-    n_vacancies = len(df_filtered)
-
-    # --- МАТЕМАТИКА РАСЧЕТА КОЭФФИЦИЕНТА ---
-    avg_density = df_filtered["requirements_density"].mean() if n_vacancies > 0 else 5
-
-    grade_multipliers = {"Junior": 0.5, "Middle": 1.0, "Senior": 1.5}
-    multiplier = grade_multipliers.get(selected_grade, 1.0)
-
-    # Критика друга: Почему 10? Оставили безопасный дефолт, но убрали жесткий хардкод
-    competition_indexes = {"Junior": 35.0, "Middle": 4.5, "Senior": 1.8}
-    comp_index = competition_indexes.get(selected_grade, 5.0)
-
-    if n_vacancies > 0:
-        raw_score = (n_vacancies * (10 - avg_density) * multiplier) / comp_index
-        k_demand = min(max(round(raw_score / 3, 1), 1.0), 10.0)
-    else:
-        k_demand = 1.0
-
-    # 1. Группируем данные из БД по грейдам
-    df_grade = df.groupby('ai_grade').agg(
-        n_count=('sentiment_score', 'count'),
-
-        # Средние значения (твои 6.5 - 7.5)
-        avg_sentiment=('sentiment_score', 'mean'),
-        avg_density=('requirements_density', 'mean'),
-
-        # 🕵️‍♂️ А вот это покажет экстремумы:
-        min_sentiment=('sentiment_score', 'min'),
-        max_sentiment=('sentiment_score', 'max')
-    ).reset_index()
-
-    # 2. Находим максимальное количество вакансий среди всех грейдов
-    max_vacancies = df_grade['n_count'].max()
-
-    # 3. НАША НОВАЯ НАУЧНО-ВЗВЕШЕННАЯ ФОРМУЛА
-    # Считаем логарифмы для сглаживания объемов рынка
-    log_n = np.log(df_grade['n_count'] + 1)
-    log_max = np.log(max_vacancies + 1)
-
-    # Применяем формулу с весами (0.4, 0.4, 0.2)
-    df_grade['w_score'] = (
-    (log_n / log_max) * 0.4 +  # Взвешенный объем рынка
-    (df_grade['avg_sentiment'] / 10) * 0.4 +  # Оценка лояльности
-    (1 - df_grade['avg_density'] / 10) * 0.2  # Инверсия жесткости требований
-     ) * 100
-
-    # Округляем до двух знаков после запятой для красоты
-    df_grade['w_score'] = df_grade['w_score'].round(2)
-
-    # --- ИНТЕРФЕЙС ДАШБОРДА ---
-    st.title(f"📊 Анализ востребованности: {selected_tech} ({selected_grade})")
-    st.caption("Аналитическая система на базе данных Хабр Карьеры и локального ИИ")
-
-    st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.metric(label="🎯 Коэффициент востребованности", value=f"{k_demand} / 10")
-    with col2:
-        st.metric(label="💼 Чистых вакансий этого грейда", value=n_vacancies)
-    with col3:
-        st.metric(label="🤯 Индекс конкуренции (чел/место)", value=f"~{comp_index}")
-
-    st.markdown("---")
-
-    if n_vacancies > 0:
-        left_chart, right_chart = st.columns(2)
-
-        with left_chart:
-            st.subheader(f"🔥 Доля грейда {selected_grade} среди вакансий {selected_tech}")
-            lang_df = df[tech_mask]
-            grade_counts = lang_df["grade"].value_counts().reset_index()
-            grade_counts.columns = ["Грейд", "Вакансии"]
-            fig_pie = px.pie(
-                grade_counts,
-                values="Вакансии",
-                names="Грейд",
-                color_discrete_sequence=px.colors.sequential.Plotly3,
-            )
-            st.plotly_chart(fig_pie, use_container_width=True)
-
-        with right_chart:
-            st.subheader("🛠️ Сопутствующие технологии в описании")
-
-            keywords_map = {
-                "Python": ["django", "flask", "fastapi", "postgresql", "docker", "linux", "asyncio", "redis",
-                           "kubernetes", "pytest"],
-                "C++": ["cmake", "linux", "git", "stl", "boost", "qt", "docker", "multithreading"],
-                "Go": ["docker", "kubernetes", "postgresql", "grpc", "microservices", "redis", "kafka"],
-                "DevOps": ["docker", "kubernetes", "ansible", "terraform", "ci/cd", "jenkins", "linux", "bash"],
-                "QA": ["selenium", "playwright", "pytest", "postman", "allure", "git", "rest api"]
-            }
-
-            tech_keywords = keywords_map.get(selected_tech, [])
-            detected_skills = []
-
-            for desc in df_filtered["description"].dropna():
-                if tech_keywords:
-                    for tech in tech_keywords:
-                        if tech in desc.lower():
-                            detected_skills.append(tech.capitalize())
-                else:
-                    # Учитываем критику друга: регулярка r'\b[a-zA-Z]{3,15}\b' выкидывала 'Go' и '1C'.
-                    # Новая регулярка ловит слова от 2 до 15 символов, сохраняя Go!
-                    words = re.findall(r'\b[a-zA-Z]{2,15}\b', desc)
-                    for w in words:
-                        if w.lower() not in ["with", "from", "this", "that", "your", "team", "work", "development",
-                                             "experience", "knowledge"]:
-                            detected_skills.append(w.capitalize())
-
-            if detected_skills:
-                skills_df = pd.DataFrame(detected_skills, columns=["Технология"])
-                skills_counts = skills_df["Технология"].value_counts().reset_index().head(8)
-                skills_counts.columns = ["Технология", "Упоминаний"]
-
-                fig_bar = px.bar(
-                    skills_counts,
-                    x="Упоминаний",
-                    y="Технология",
-                    orientation="h",
-                    text_auto=True,
-                    color="Упоминаний",
-                    color_continuous_scale="Viridis",
-                )
-                fig_bar.update_layout(yaxis={"categoryorder": "total ascending"})
-                st.plotly_chart(fig_bar, use_container_width=True)
-            else:
-                st.info("В описаниях вакансий не найдено специфичных хард-скиллов.")
-
-        st.subheader("🤖 Вердикт локального ИИ")
-        avg_sentiment = df_filtered["sentiment_score"].mean()
-
-        st.write(
-            f"• **Сложность требований для {selected_grade} {selected_tech}:** {avg_density:.1f} из 10. "
-            + (
-                "Работодатели задирают планку, чек-лист очень плотный." if avg_density > 6 else "Требования стандартные, без лишней жести.")
-        )
-        st.write(
-            f"• **Лояльность к обучению:** {avg_sentiment:.1f} из 10. "
-            + (
-                "Отличный стек для старта, компании готовы вкладываться в менторство." if avg_sentiment > 6 else "Обучать некому, от кандидата ждут полной автономности с первого дня.")
-        )
-    else:
-        st.warning(f"⚠️ В базе данных пока нет вакансий по запросу {selected_tech} для грейда {selected_grade}.")
+# Нормируем от 0 до 100
+if max_k == min_k:
+    global_stats['k_score'] = 100.0  # Защита от деления на ноль
 else:
-    st.warning("База данных пуста или все записи были отфильтрованы как невалидные!")
+    global_stats['k_score'] = ((global_stats['k_raw'] - min_k) / (max_k - min_k)) * 100
+
+global_stats['k_score'] = global_stats['k_score'].round(2)
+
+# --------------------------------------------------------
+# SIDEBAR И ФИЛЬТРАЦИЯ ДЛЯ ВЫВОДА
+# --------------------------------------------------------
+
+st.sidebar.header("Фильтры")
+
+technology = st.sidebar.selectbox(
+    "Технология",
+    sorted(df["technology"].unique())
+)
+
+grade = st.sidebar.radio(
+    "Грейд",
+    ["Junior", "Middle", "Senior"]
+)
+
+# Фильтруем сырые данные для таблиц
+filtered = df[
+    (df["technology"] == technology) & (df["ai_grade"] == grade)
+].copy()
+
+# Достаем уже посчитанные метрики для выбранной комбинации
+selected_stat = global_stats[
+    (global_stats['technology'] == technology) & (global_stats['ai_grade'] == grade)
+]
+
+if filtered.empty or selected_stat.empty:
+    st.warning("По выбранным параметрам вакансии отсутствуют.")
+    st.stop()
+
+selected_stat = selected_stat.iloc[0]
+
+st.subheader(f"{technology} • {grade}")
+
+# --------------------------------------------------------
+# ИЗВЛЕЧЕНИЕ РАССЧИТАННЫХ ДАННЫХ
+# --------------------------------------------------------
+
+vacancies_count = int(selected_stat['count'])
+avg_salary = selected_stat['avg_salary']
+avg_density = selected_stat['avg_density']
+avg_competition = selected_stat['avg_comp']
+
+Nn = selected_stat['Nn']
+Sn = selected_stat['Sn']
+Dn = selected_stat['Dn']
+Gn = selected_stat['Gn']
+Cn = selected_stat['Cn']
+k_raw = selected_stat['k_raw']
+k_score = selected_stat['k_score']
+
+# --------------------------------------------------------
+# ИНТЕРПРЕТАЦИЯ
+# --------------------------------------------------------
+
+if k_score < 35:
+    demand = "🔴 Низкий спрос"
+elif k_score < 60:
+    demand = "🟡 Средний спрос"
+elif k_score < 80:
+    demand = "🟢 Высокий спрос"
+else:
+    demand = "🔥 Очень высокий спрос"
+
+# --------------------------------------------------------
+# KPI
+# --------------------------------------------------------
+
+c1, c2, c3, c4 = st.columns(4)
+
+c1.metric(
+    "📈 Коэффициент востребованности",
+    f"{k_score}/100"
+)
+
+c2.metric(
+    "💼 Вакансий",
+    vacancies_count
+)
+
+c3.metric(
+    "💰 Средняя зарплата",
+    f"{avg_salary:.2f}"
+)
+
+c4.metric(
+    "🏆 Оценка",
+    demand
+)
+
+st.divider()
+
+# --------------------------------------------------------
+# ПОКАЗАТЕЛИ МОДЕЛИ
+# --------------------------------------------------------
+
+left, right = st.columns([1, 1])
+
+with left:
+    st.subheader("Показатели модели")
+    st.metric("Плотность требований", round(avg_density, 2))
+    st.metric("Конкуренция", round(avg_competition, 2))
+    st.metric("Грейд", grade)
+
+with right:
+    st.subheader("Нормированные значения")
+    norm = pd.DataFrame({
+        "Параметр": ["Nₙ", "Sₙ", "Dₙ", "Gₙ", "Cₙ"],
+        "Значение": [round(Nn, 3), round(Sn, 3), round(Dn, 3), round(Gn, 3), round(Cn, 3)]
+    })
+
+    st.dataframe(
+        norm,
+        hide_index=True,
+        use_container_width=True
+    )
+
+st.divider()
+
+# --------------------------------------------------------
+# РАСЧЕТ ФОРМУЛЫ
+# --------------------------------------------------------
+
+st.subheader("Расчет коэффициента")
+
+st.latex(r"""
+K_{raw} = 0.35N_n + 0.25S_n + 0.20D_n + 0.05G_n - 0.15C_n
+""")
+st.latex(r"""
+K_{score} = \frac{K_{raw} - K_{min}}{K_{max} - K_{min}} \times 100
+""")
+
+st.code(f"""
+[1] Подставляем нормированные значения в сырую формулу:
+Nn = {Nn:.3f} | Sn = {Sn:.3f} | Dn = {Dn:.3f} | Gn = {Gn:.3f} | Cn = {Cn:.3f}
+
+K_raw = (0.35 × {Nn:.3f}) + (0.25 × {Sn:.3f}) + (0.20 × {Dn:.3f}) + (0.05 × {Gn:.3f}) - (0.15 × {Cn:.3f})
+K_raw = {k_raw:.4f}
+
+[2] Применяем Min-Max нормализацию относительно всего рынка:
+Абсолютный минимум рынка (K_min) = {min_k:.4f}
+Абсолютный максимум рынка (K_max) = {max_k:.4f}
+
+K_score = ({k_raw:.4f} - {min_k:.4f}) / ({max_k:.4f} - {min_k:.4f}) * 100
+K_score = {k_score:.2f}
+""")
+
+# --------------------------------------------------------
+# ГРАФИК ВКЛАДА КРИТЕРИЕВ В КОЭФФИЦИЕНТ
+# --------------------------------------------------------
+
+st.subheader("📊 Вклад каждого критерия (в сырой K_raw)")
+
+contrib = pd.DataFrame({
+    "Критерий": [
+        "Количество",
+        "Зарплата",
+        "Требования",
+        "Грейд",
+        "Конкуренция"
+    ],
+    "Вклад": [
+        0.35 * Nn,
+        0.25 * Sn,
+        0.20 * Dn,
+        0.05 * Gn,
+        -0.15 * Cn
+    ]
+})
+
+fig = px.bar(
+    contrib,
+    x="Критерий",
+    y="Вклад",
+    text="Вклад",
+    color="Вклад",
+    color_continuous_scale="RdBu"
+)
+
+fig.update_traces(texttemplate="%{text:.3f}")
+st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# --------------------------------------------------------
+# ТОП НАВЫКОВ
+# --------------------------------------------------------
+
+st.subheader("🛠 Наиболее востребованные навыки")
+
+skills = []
+for value in filtered["skills"].dropna():
+    if isinstance(value, str):
+        for skill in value.split(","):
+            skill = skill.strip()
+            if len(skill) > 1:
+                skills.append(skill)
+
+counter = Counter(skills)
+top_skills = pd.DataFrame(
+    counter.most_common(15),
+    columns=["Навык", "Количество"]
+)
+
+if not top_skills.empty:
+    fig = px.bar(
+        top_skills,
+        x="Количество",
+        y="Навык",
+        orientation="h",
+        text="Количество"
+    )
+    fig.update_layout(height=500, yaxis={'categoryorder': 'total ascending'})
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("Навыки для выбранных параметров отсутствуют.")
+
+st.divider()
+
+# --------------------------------------------------------
+# ТОП КОМПАНИЙ
+# --------------------------------------------------------
+
+st.subheader("🏢 Компании, которые чаще всего ищут специалистов")
+
+company_df = (
+    filtered["company"]
+    .value_counts()
+    .head(10)
+    .reset_index()
+)
+company_df.columns = ["Компания", "Вакансий"]
+
+fig = px.bar(
+    company_df,
+    x="Компания",
+    y="Вакансий",
+    text="Вакансий"
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# --------------------------------------------------------
+# СПИСОК ВАКАНСИЙ
+# --------------------------------------------------------
+
+st.subheader("📄 Найденные вакансии")
+
+table = filtered[[
+    "title",
+    "company",
+    "salary",
+    "salary_score",
+    "competition_score",
+    "requirements_density",
+    "link"
+]]
+
+table.columns = [
+    "Название",
+    "Компания",
+    "Зарплата (текст)",
+    "Оценка ИИ: Зарплата",
+    "Оценка ИИ: Конкуренция",
+    "Оценка ИИ: Требования",
+    "Ссылка"
+]
+
+st.dataframe(
+    table,
+    use_container_width=True,
+    hide_index=True
+)
+
+st.divider()
+
+# --------------------------------------------------------
+# СТАТИСТИКА ПО ВСЕМ ГРЕЙДАМ ВЫБРАННОЙ ТЕХНОЛОГИИ
+# --------------------------------------------------------
+
+st.subheader(f"📈 Сравнение грейдов для {technology}")
+
+# Вытаскиваем уже посчитанные глобальные данные для выбранной технологии
+tech_grades = global_stats[global_stats['technology'] == technology].copy()
+tech_grades = tech_grades.sort_values(by='grade_num')
+
+if not tech_grades.empty:
+    fig = px.bar(
+        tech_grades,
+        x="ai_grade",
+        y="k_score",
+        text="k_score",
+        color="ai_grade",
+        color_discrete_map={'Junior': '#1f77b4', 'Middle': '#2ca02c', 'Senior': '#ff7f0e'},
+        labels={"ai_grade": "Грейд", "k_score": "Интегральный индекс (0-100)"}
+    )
+    fig.update_layout(yaxis_range=[0, 100], showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+st.divider()
+
+# --------------------------------------------------------
+# СПРАВКА
+# --------------------------------------------------------
+
+with st.expander("ℹ️ О методике расчета"):
+    st.markdown("""
+### Интегральный коэффициент востребованности
+
+Используется аддитивная многокритериальная модель с Min-Max нормализацией:
+
+1. **Сырой вес (K_raw) = 0.35·N + 0.25·S + 0.20·D + 0.05·G − 0.15·C**
+2. **Итоговый балл (K_score) = (K_raw - K_min) / (K_max - K_min) × 100**
+
+где:
+- **N** — количество вакансий (логарифмически сглаженное);
+- **S** — нормированная оценка заработной платы (1-10);
+- **D** — плотность требований работодателя (1-10);
+- **G** — уровень квалификации (1-3);
+- **C** — уровень конкуренции на вакансию (1-10).
+
+Все показатели предварительно нормируются в диапазоне 0…1.
+Весовые коэффициенты определены методом анализа иерархий (AHP).
+Приведение результата к шкале от 0 до 100 относительно всего рынка позволяет получить объективную оценку:
+от 🔴 **Низкого спроса (самая непривлекательная связка на рынке)** до 🔥 **Очень высокого спроса (самая востребованная)**.
+""")
+
+st.success("✅ Анализ завершён.")

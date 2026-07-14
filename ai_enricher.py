@@ -1,83 +1,128 @@
 import sqlite3
 import json
-import ollama
+import os
 import sys
+import time
+from google import genai
+from google.genai import types
 
 DB_NAME = "habr_analytics.db"
 
+# Укажи свой API-ключ прямо здесь
+GEMINI_API_KEY = "AQ.Ab8RN6LBI4az56h26BzhF-coIna0RXpF12EGqUizPXx-a-o27A"
+
+client = genai.Client(api_key=GEMINI_API_KEY)
+
 
 def init_ai_columns():
-    """Добавляем новые колонки в базу, если их еще нет."""
+    """Добавляет новые столбцы в БД, если их еще нет"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    # Добавляем колонки по одной (try/except защищает, если они уже созданы)
+    # Новые столбцы под нашу крутую математическую формулу
     columns = [
         ("requirements_density", "INTEGER"),
-        ("sentiment_score", "INTEGER"),
-        ("ai_grade", "TEXT")  # Сюда будем писать строгий текст 'Junior', 'Middle', 'Senior'
+        ("salary_score", "INTEGER"),
+        ("competition_score", "INTEGER"),
+        ("ai_grade", "TEXT")
     ]
-
     for col_name, col_type in columns:
         try:
             cursor.execute(f"ALTER TABLE vacancies ADD COLUMN {col_name} {col_type}")
         except sqlite3.OperationalError:
-            pass  # Колонка уже существует
-
+            pass  # Если столбец уже существует, просто идем дальше
     conn.commit()
     conn.close()
 
 
-def analyze_vacancy_with_ai(title, description):
-    """
-    Отправляет вакансию в Ollama.
-    Использует цифры 1, 2, 3 для грейдов, чтобы избежать проблем с токенами ИИ.
-    """
+def analyze_vacancy_with_gemini(title, description):
+    """Отправляет вакансию в Google Gemini. Возвращает строго распарсенный JSON."""
     system_prompt = (
-        "You are an IT Recruiter API. Analyze the job description and return ONLY a valid JSON object.\n"
-        "Keys to return:\n"
-        "1. 'density': Requirements complexity (integer from 1 to 10).\n"
-        "2. 'sentiment': Company's willingness to mentor/train (integer from 1 to 10).\n"
-        "3. 'grade_code': Candidate level. Return ONLY integer: 1 for Junior, 2 for Middle, 3 for Senior.\n\n"
-        "Example output:\n"
-        '{"density": 5, "sentiment": 8, "grade_code": 2}'
+        f"""
+Ты — строгий HR-аналитик. Проанализируй текст IT-вакансии:
+Название: {title}
+Описание: {description}
+
+Верни результат СТРОГО в формате JSON с 4 ключами.
+Оценивай параметры строго по шкале от 1 до 10:
+
+1. "salary_score" (Заработная плата и финансовые условия):
+   - 1-3: Зарплата ниже рынка, стажировка за копейки, либо жесткие штрафы.
+   - 4-7: Средняя рыночная зарплата, стандартный соцпакет.
+   - 8-10: Зарплата выше рынка, премии, акции компании, отличный ДМС.
+   (Если зарплата не указана, оценивай косвенные признаки богатства компании и щедрости описания).
+
+2. "requirements_density" (Плотность требований):
+   - 1-3: Минимум требований (знание синтаксиса, желание развиваться).
+   - 4-7: Стандартный стек технологий для одной роли.
+   - 8-10: Ищут "человека-оркестр", гигантский список фреймворков и DevOps-инструментов.
+
+3. "competition_score" (Индекс конкуренции):
+   Оцени, насколько высока конкуренция соискателей на эту вакансию:
+   - 1-3: Низкая конкуренция (очень узкая ниша, высокие требования, уровень Senior).
+   - 4-7: Средняя конкуренция (стандартные Middle позиции).
+   - 8-10: Огромная конкуренция (позиции Junior, стажировки, "войти в IT").
+
+4. "ai_grade":
+   Определи требуемый уровень: "Junior", "Middle" или "Senior".
+
+Формат вывода СТРОГО валидный JSON:
+{{
+  "salary_score": 0,
+  "requirements_density": 0,
+  "competition_score": 0,
+  "ai_grade": "Grade"
+}}
+"""
     )
 
-    user_content = f"Job Title: {title}\nDescription:\n{description}"
+    short_desc = description[:6000] if description else ""
 
     try:
-        response = ollama.chat(
-            model='llama3',
-            messages=[
-                {'role': 'system', 'content': system_prompt},
-                {'role': 'user', 'content': user_content}
-            ],
-            format='json',
-            options={'temperature': 0.0}
+        response = client.models.generate_content(
+            model="gemini-flash-lite-latest",
+            contents=f"Title: {title}\nDesc: {short_desc}",
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.0,
+                response_mime_type="application/json"
+            ),
         )
 
-        raw_json = response['message']['content'].strip()
+        raw_json = response.text.strip()
         data = json.loads(raw_json)
 
-        # Строгая валидация полей из JSON
-        density = int(data['density'])
-        sentiment = int(data['sentiment'])
-        grade_code = int(data['grade_code'])
+        # ИСПРАВЛЕНИЕ: Вытаскиваем именно те ключи, которые запросили в промпте
+        salary = int(data.get('salary_score', 5))
+        density = int(data.get('requirements_density', 5))
+        competition = int(data.get('competition_score', 5))
 
-        # Проверяем диапазоны, чтобы ИИ не выдал "15 из 10"
-        if not (1 <= density <= 10) or not (1 <= sentiment <= 10):
-            raise ValueError("Метрики вышли за пределы диапазона 1-10")
+        # Грейд нейросеть теперь возвращает текстом ("Junior", "Middle", "Senior")
+        ai_grade = data.get('ai_grade', "Middle")
+        if ai_grade not in ["Junior", "Middle", "Senior"]:
+            ai_grade = "Middle"  # Защита от галлюцинаций ИИ
 
-        # Мапим цифровые коды обратно в понятные сайту строки
-        grade_map = {1: "Junior", 2: "Middle", 3: "Senior"}
-        grade_str = grade_map.get(grade_code, "Middle")
+        return density, salary, competition, ai_grade
 
-        return density, sentiment, grade_str
-
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        # Не жрем ошибку молча, а возвращаем None, чтобы забраковать запись
-        print(f"⚠️ Ошибка парсинга ИИ для '{title}': {e}", file=sys.stderr)
+    except Exception as e:
+        print(f"\n⚠️ Ошибка Gemini API на вакансии '{title}': {e}")
         return None
+
+
+def save_batch_to_db(batch_updates):
+    """Записывает пачку обновлений в базу данных одним запросом."""
+    if not batch_updates:
+        return
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    # ИСПРАВЛЕНИЕ: Добавлены новые колонки для записи
+    cursor.executemany(
+        "UPDATE vacancies SET requirements_density = ?, salary_score = ?, competition_score = ?, ai_grade = ? WHERE id = ?",
+        batch_updates
+    )
+    conn.commit()
+    conn.close()
+    print(f"\n💾 [ПАКЕТ ХРАНЕНИЯ]: {len(batch_updates)} вакансий успешно зафиксированы в БД!")
 
 
 def enrich_data():
@@ -85,56 +130,49 @@ def enrich_data():
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-
-    # Вытаскиваем записи, где разметка еще не проводилась
-    cursor.execute("SELECT id, title, description FROM vacancies WHERE ai_grade IS NULL")
+    cursor.execute(
+        "SELECT id, title, description FROM vacancies WHERE ai_grade IS NULL OR ai_grade = 'ERROR' OR ai_grade = 'SKIP'")
     vacancies = cursor.fetchall()
+    conn.close()
 
     if not vacancies:
-        print("✅ Все вакансии в базе уже успешно обработаны ИИ!")
-        conn.close()
+        print("✅ Все вакансии в базе уже успешно размечены!")
         return
 
-    print(f"🤖 Начинаю пакетный ИИ-анализ вакансий. Всего к обработке: {len(vacancies)}")
+    print(f"🚀 Запускаю ускоренную пакетную разметку через Google Gemini API. К обработке: {len(vacancies)}")
 
-    # Кэш в оперативной памяти для пакетной вставки
-    db_update_cache = []
-    broken_records_count = 0
+    batch_updates = []
+    batch_size = 10
 
     for idx, (v_id, title, desc) in enumerate(vacancies, 1):
-        # Критика друга: Бракуем записи без описания сразу, они срут в статистику
-        if not desc or len(desc.strip()) < 10:
-            print(f"[{idx}/{len(vacancies)}] ❌ Забраковано (нет описания): {title}")
-            # Помечаем в базе как ERROR, чтобы скрипт не мучал её при следующем запуске
-            db_update_cache.append((-1, -1, "ERROR", v_id))
-            broken_records_count += 1
-            continue
-
-        print(f"[{idx}/{len(vacancies)}] Llama 3 анализирует: {title}")
-
-        ai_result = analyze_vacancy_with_ai(title, desc)
-
-        if ai_result is None:
-            # Если ИИ прислал битый JSON — бракуем запись, пишем ERROR
-            db_update_cache.append((-1, -1, "ERROR", v_id))
-            broken_records_count += 1
+        if not desc or len(desc.strip()) < 15:
+            # ИСПРАВЛЕНИЕ: Добавлен лишний None, так как теперь у нас 4 параметра + id
+            batch_updates.append((None, None, None, 'EMPTY', v_id))
+            print(f"[{idx}/{len(vacancies)}] Пропущено (пустое описание): {title}")
         else:
-            density, sentiment, grade_str = ai_result
-            # Складываем данные в кэш
-            db_update_cache.append((density, sentiment, grade_str, v_id))
+            print(f"[{idx}/{len(vacancies)}] Gemini обрабатывает: {title}...", end="", flush=True)
 
-    # Критика друга: Пушим все данные в БД ОДНИМ ПАКЕТОМ (транзакцией)
-    if db_update_cache:
-        print(f"\n📦 Записываю пакет из {len(db_update_cache)} обновлений в базу данных...")
-        cursor.executemany(
-            "UPDATE vacancies SET requirements_density = ?, sentiment_score = ?, ai_grade = ? WHERE id = ?",
-            db_update_cache
-        )
-        conn.commit()
+            ai_result = analyze_vacancy_with_gemini(title, desc)
 
-    conn.close()
-    print(
-        f"🎉 Разметка завершена! Успешно обработано: {len(db_update_cache) - broken_records_count}, забраковано: {broken_records_count}")
+            if ai_result is None:
+                batch_updates.append((None, None, None, 'SKIP', v_id))
+                print(" ❌ Ошибка API (Будет повторено при перезапуске)")
+            else:
+                # ИСПРАВЛЕНИЕ: Распаковываем 4 параметра
+                density, salary, competition, grade_str = ai_result
+                batch_updates.append((density, salary, competition, grade_str, v_id))
+                print(" OK")
+
+        if len(batch_updates) >= batch_size:
+            save_batch_to_db(batch_updates)
+            batch_updates = []
+
+        time.sleep(4.5)
+
+    if batch_updates:
+        save_batch_to_db(batch_updates)
+
+    print(f"\n🎉 Обработка успешно завершена! Можешь обновлять app.py и смотреть результат.")
 
 
 if __name__ == "__main__":
