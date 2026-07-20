@@ -3,15 +3,15 @@ import json
 import os
 import sys
 import time
-from google import genai
-from google.genai import types
+import requests
 
 DB_NAME = "habr_analytics.db"
 
-# Укажи свой API-ключ прямо здесь
-GEMINI_API_KEY = "AQ.Ab8RN6LBI4az56h26BzhF-coIna0RXpF12EGqUizPXx-a-o27A"
+# Адрес локального сервера Ollama по умолчанию
+OLLAMA_URL = "http://localhost:11434"
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+# Какую модель мы хотим использовать в идеале
+OLLAMA_MODEL = "gemma2"
 
 
 def init_ai_columns():
@@ -19,7 +19,6 @@ def init_ai_columns():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    # Новые столбцы под нашу крутую математическую формулу
     columns = [
         ("requirements_density", "INTEGER"),
         ("salary_score", "INTEGER"),
@@ -30,21 +29,31 @@ def init_ai_columns():
         try:
             cursor.execute(f"ALTER TABLE vacancies ADD COLUMN {col_name} {col_type}")
         except sqlite3.OperationalError:
-            pass  # Если столбец уже существует, просто идем дальше
+            pass  # Столбец уже существует
     conn.commit()
     conn.close()
 
 
-def analyze_vacancy_with_gemini(title, description):
-    """Отправляет вакансию в Google Gemini. Возвращает строго распарсенный JSON."""
-    system_prompt = (
-        f"""
-Ты — строгий HR-аналитик. Проанализируй текст IT-вакансии:
-Название: {title}
-Описание: {description}
+def get_installed_models():
+    """Запрашивает у локального сервера Ollama список всех скачанных моделей."""
+    try:
+        response = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            return [model["name"] for model in data.get("models", [])]
+    except Exception:
+        pass
+    return []
 
-Верни результат СТРОГО в формате JSON с 4 ключами.
-Оценивай параметры строго по шкале от 1 до 10:
+
+def analyze_vacancy_with_ollama(title, description, active_model):
+    """
+    Отправляет вакансию в локальную Ollama.
+    Использует встроенный в Ollama режим гарантированного форматирования JSON.
+    """
+    system_prompt = (
+        """Ты — строгий HR-аналитик. Проанализируй текст IT-вакансии.
+Оцени параметры строго по шкале от 1 до 10:
 
 1. "salary_score" (Заработная плата и финансовые условия):
    - 1-3: Зарплата ниже рынка, стажировка за копейки, либо жесткие штрафы.
@@ -53,7 +62,7 @@ def analyze_vacancy_with_gemini(title, description):
    (Если зарплата не указана, оценивай косвенные признаки богатства компании и щедрости описания).
 
 2. "requirements_density" (Плотность требований):
-   - 1-3: Минимум требований (знание синтаксиса, желание развиваться).
+   - 1-3:  Минимум требований (знание синтаксиса, желание развиваться).
    - 4-7: Стандартный стек технологий для одной роли.
    - 8-10: Ищут "человека-оркестр", гигантский список фреймворков и DevOps-инструментов.
 
@@ -66,46 +75,58 @@ def analyze_vacancy_with_gemini(title, description):
 4. "ai_grade":
    Определи требуемый уровень: "Junior", "Middle" или "Senior".
 
-Формат вывода СТРОГО валидный JSON:
-{{
-  "salary_score": 0,
-  "requirements_density": 0,
-  "competition_score": 0,
-  "ai_grade": "Grade"
-}}
-"""
+Ты должен вернуть СТРОГО валидный JSON-объект без какого-либо лишнего текста вокруг следующего формата:
+{
+  "salary_score": 5,
+  "requirements_density": 5,
+  "competition_score": 5,
+  "ai_grade": "Middle"
+}"""
     )
 
-    short_desc = description[:6000] if description else ""
+    short_desc = description[:5000] if description else ""
+    user_content = f"Название вакансии: {title}\nОписание вакансии:\n{short_desc}"
+
+    payload = {
+        "model": active_model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "stream": False,
+        "format": "json",  # Флаг заставляет Ollama форматировать ответ строго в JSON
+        "options": {
+            "temperature": 0.0  # Убираем креативность для точности оценок
+        }
+    }
 
     try:
-        response = client.models.generate_content(
-            model="gemini-flash-lite-latest",
-            contents=f"Title: {title}\nDesc: {short_desc}",
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                temperature=0.0,
-                response_mime_type="application/json"
-            ),
-        )
+        response = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=45)
 
-        raw_json = response.text.strip()
+        if response.status_code == 404:
+            return "MODEL_NOT_FOUND"
+
+        if response.status_code != 200:
+            print(f" ❌ Ошибка сервера Ollama (Код {response.status_code})")
+            return None
+
+        result_data = response.json()
+        raw_json = result_data["message"]["content"].strip()
+
         data = json.loads(raw_json)
 
-        # ИСПРАВЛЕНИЕ: Вытаскиваем именно те ключи, которые запросили в промпте
         salary = int(data.get('salary_score', 5))
         density = int(data.get('requirements_density', 5))
         competition = int(data.get('competition_score', 5))
 
-        # Грейд нейросеть теперь возвращает текстом ("Junior", "Middle", "Senior")
         ai_grade = data.get('ai_grade', "Middle")
         if ai_grade not in ["Junior", "Middle", "Senior"]:
-            ai_grade = "Middle"  # Защита от галлюцинаций ИИ
+            ai_grade = "Middle"
 
         return density, salary, competition, ai_grade
 
     except Exception as e:
-        print(f"\n⚠️ Ошибка Gemini API на вакансии '{title}': {e}")
+        print(f" ❌ Ошибка парсинга JSON: {e}")
         return None
 
 
@@ -115,7 +136,6 @@ def save_batch_to_db(batch_updates):
         return
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # ИСПРАВЛЕНИЕ: Добавлены новые колонки для записи
     cursor.executemany(
         "UPDATE vacancies SET requirements_density = ?, salary_score = ?, competition_score = ?, ai_grade = ? WHERE id = ?",
         batch_updates
@@ -126,12 +146,48 @@ def save_batch_to_db(batch_updates):
 
 
 def enrich_data():
+    global OLLAMA_MODEL
+
+    # 1. Проверяем, запущен ли сервер Ollama локально
+    try:
+        requests.get(f"{OLLAMA_URL}/", timeout=3)
+    except requests.exceptions.ConnectionError:
+        print("\n❌ ОШИБКА: Сервер Ollama не обнаружен!")
+        print("1. Убедись, что Ollama запущена на твоем компьютере.")
+        print("2. Запусти в PowerShell команду: ollama serve\n")
+        sys.exit(1)
+
+    # 2. Получаем список всех установленных моделей
+    installed_models = get_installed_models()
+
+    if not installed_models:
+        print("\n❌ ОШИБКА: У тебя в Ollama не скачано ни одной модели!")
+        print("Пожалуйста, открой еще одно окно PowerShell (не закрывая то, где запущен 'ollama serve')")
+        print(f"и запусти команду скачивания:  ollama pull {OLLAMA_MODEL}\n")
+        sys.exit(1)
+
+    # 3. Выбираем модель: если gemma2 не установлена, берем ту, что есть в наличии
+    active_model = OLLAMA_MODEL
+    # Ищем точное или частичное совпадение
+    matching_model = next((m for m in installed_models if OLLAMA_MODEL in m), None)
+
+    if matching_model:
+        active_model = matching_model
+    else:
+        # Если нашей gemma2 нет, берем самую первую из списка установленных у пользователя
+        active_model = installed_models[0]
+        print(f"⚠️ Модель '{OLLAMA_MODEL}' не найдена локально.")
+        print(f"🔄 Автоматически переключаюсь на твою установленную модель: '{active_model}'!")
+
     init_ai_columns()
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, title, description FROM vacancies WHERE ai_grade IS NULL OR ai_grade = 'ERROR' OR ai_grade = 'SKIP'")
+    cursor.execute("""
+        SELECT id, title, description 
+        FROM vacancies 
+        WHERE ai_grade IS NULL OR ai_grade = 'ERROR' OR ai_grade = 'SKIP'
+    """)
     vacancies = cursor.fetchall()
     conn.close()
 
@@ -139,26 +195,30 @@ def enrich_data():
         print("✅ Все вакансии в базе уже успешно размечены!")
         return
 
-    print(f"🚀 Запускаю ускоренную пакетную разметку через Google Gemini API. К обработке: {len(vacancies)}")
+    print(
+        f"🚀 Запускаю локальный анализ через Ollama (Активная модель: {active_model}). Осталось разметить: {len(vacancies)}")
 
     batch_updates = []
     batch_size = 10
 
     for idx, (v_id, title, desc) in enumerate(vacancies, 1):
         if not desc or len(desc.strip()) < 15:
-            # ИСПРАВЛЕНИЕ: Добавлен лишний None, так как теперь у нас 4 параметра + id
             batch_updates.append((None, None, None, 'EMPTY', v_id))
             print(f"[{idx}/{len(vacancies)}] Пропущено (пустое описание): {title}")
         else:
-            print(f"[{idx}/{len(vacancies)}] Gemini обрабатывает: {title}...", end="", flush=True)
+            print(f"[{idx}/{len(vacancies)}] Ollama ({active_model}) обрабатывает: {title}...", end="", flush=True)
 
-            ai_result = analyze_vacancy_with_gemini(title, desc)
+            ai_result = analyze_vacancy_with_ollama(title, desc, active_model)
 
-            if ai_result is None:
+            if ai_result == "MODEL_NOT_FOUND":
+                print(f"\n\n❌ ОШИБКА 404: Модель '{active_model}' внезапно пропала из Ollama!")
+                if batch_updates:
+                    save_batch_to_db(batch_updates)
+                sys.exit(1)
+
+            elif ai_result is None:
                 batch_updates.append((None, None, None, 'SKIP', v_id))
-                print(" ❌ Ошибка API (Будет повторено при перезапуске)")
             else:
-                # ИСПРАВЛЕНИЕ: Распаковываем 4 параметра
                 density, salary, competition, grade_str = ai_result
                 batch_updates.append((density, salary, competition, grade_str, v_id))
                 print(" OK")
@@ -167,12 +227,12 @@ def enrich_data():
             save_batch_to_db(batch_updates)
             batch_updates = []
 
-        time.sleep(4.5)
+        time.sleep(0.05)
 
     if batch_updates:
         save_batch_to_db(batch_updates)
 
-    print(f"\n🎉 Обработка успешно завершена! Можешь обновлять app.py и смотреть результат.")
+    print(f"\n🎉 Локальный анализ успешно завершен! Все новые данные зафиксированы в базе {DB_NAME}.")
 
 
 if __name__ == "__main__":
