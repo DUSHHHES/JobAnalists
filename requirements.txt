@@ -4,3 +4,4 @@ streamlit
 rapidfuzz
 nltk
 numpy
+protobuf

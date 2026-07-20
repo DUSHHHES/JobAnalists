@@ -51,13 +51,9 @@ def parse_single_vacancy_page(url):
         return ""
 
 
-def deep_mass_parse(target_total=1000):
-    """Массовый постраничный сборщик с прямым поиском карточек."""
+def deep_mass_parse(target_total=2500):
+    """Массовый бесшовный сборщик ВСЕХ вакансий с авто-исправлением пропущенных полей."""
     init_db()
-
-    # Расширенный список тегов для гарантированного набора 1000 вакансий
-    tech_queries = ["Python", "C++", "Go", "Java", "JavaScript", "Frontend", "DevOps", "QA", "Data Engineering", "C#",
-                    "Backend", "Разработчик"]
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -66,108 +62,155 @@ def deep_mass_parse(target_total=1000):
     current_count = cursor.fetchone()[0]
     print(f"📊 Текущее количество вакансий в базе: {current_count}")
 
-    if current_count >= target_total:
-        print(f"✅ Цель в {target_total} вакансий уже достигнута!")
-        conn.close()
-        return
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    print(f"🚀 Запускаю массовый постраничный сбор до цели в {target_total} позиций...")
+    print(f"🚀 Запускаю сканирование ленты Хабра до упора (цель: {target_total})...")
 
-    for query in tech_queries:
-        if current_count >= target_total:
-            break
+    page = 1
+    no_more_vacancies = False
 
-        print(f"\n🔎 Сканирую направление: [{query}]")
-        page = 1
+    while current_count < target_total and not no_more_vacancies:
+        search_url = f"https://career.habr.com/vacancies?type=all&page={page}"
 
-        while current_count < target_total:
-            search_url = f"https://career.habr.com/vacancies?q={query}&type=all&page={page}"
+        try:
+            response = requests.get(search_url, headers=headers, timeout=10)
 
-            try:
-                response = requests.get(search_url, headers=headers, timeout=10)
-
-                if response.status_code == 403:
-                    print("⚠️ Хабр выдал 403 (Антифрод). Включаю защитную паузу 10 секунд...")
-                    time.sleep(10)
-                    break
-                elif response.status_code != 200:
-                    print(f"⚠️ Хабр ответил статусом {response.status_code}. Меняем стек.")
-                    break
-
-                soup = bs4.BeautifulSoup(response.text, "html.parser")
-
-                # Трюк: ищем карточки напрямую по базовому классу 'vacancy-card'
-                vacancy_cards = soup.find_all("div", class_="vacancy-card")
-
-                if not vacancy_cards:
-                    # Попробуем найти элементы списков, если Хабр перешел на теги li
-                    vacancy_cards = soup.find_all("li", class_="vacancy-card")
-
-                if not vacancy_cards:
-                    print(f"Выкачаны все доступные страницы для стека {query} (или карточки не найдены).")
-                    break
-
-                print(f"📄 Пагинация: Направление [{query}], Страница {page}, Найдено карточек: {len(vacancy_cards)}")
-
-                for card in vacancy_cards:
-                    if current_count >= target_total:
-                        break
-
-                    # Извлекаем заголовок и ссылку
-                    title_elem = card.find("div", class_="vacancy-card__title")
-                    if not title_elem:
-                        title_elem = card.find("a", class_="vacancy-card__title-link")  # Резервный поиск ссылки
-
-                    if not title_elem: continue
-                    title = title_elem.get_text().strip()
-
-                    link_elem = title_elem.find("a") if title_elem.name != "a" else title_elem
-                    if not link_elem: continue
-                    link = "https://career.habr.com" + link_elem["href"]
-                    v_id = link.split("/")[-1].split("?")[0]
-
-                    # Проверяем дубликаты
-                    cursor.execute("SELECT 1 FROM vacancies WHERE id = ?", (v_id,))
-                    if cursor.fetchone():
-                        continue
-
-                    company_elem = card.find("div", class_="vacancy-card__company-title")
-                    company = company_elem.get_text().strip() if company_elem else "Не указана"
-
-                    salary_elem = card.find("div", class_="vacancy-card__salary")
-                    salary = salary_elem.get_text().strip() if salary_elem else "ЗП не указана"
-
-                    # Бережный тайм-аут, чтобы не перегружать сервер и обходить блокировки
-                    time.sleep(1.5)
-
-                    # Скачиваем описание
-                    description = parse_single_vacancy_page(link)
-
-                    # Пишем в БД
-                    cursor.execute(
-                        """INSERT INTO vacancies (id, title, company, salary, description, link) 
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (v_id, title, company, salary, description, link)
-                    )
-                    conn.commit()
-
-                    current_count += 1
-                    print(f"  -> Успешно скачано [{current_count}/{target_total}]: {title}")
-
-                page += 1
-
-            except Exception as e:
-                print(f"⚠️ Ошибка на странице {page}: {e}")
-                time.sleep(5)
+            if response.status_code == 403:
+                print("⚠️ Хабр выдал 403 (Антифрод). Включаю защитную паузу 15 секунд...")
+                time.sleep(15)
+                continue
+            elif response.status_code != 200:
+                print(f"⚠️ Хабр ответил статусом {response.status_code}. Прекращаем сбор.")
                 break
 
+            soup = bs4.BeautifulSoup(response.text, "html.parser")
+
+            # Ищем карточки вакансий
+            vacancy_cards = soup.find_all("div", class_="vacancy-card")
+            if not vacancy_cards:
+                vacancy_cards = soup.find_all("li", class_="vacancy-card")
+
+            if not vacancy_cards:
+                print(f"\n🏁 Достигнут абсолютный конец ленты вакансий на странице {page}!")
+                no_more_vacancies = True
+                break
+
+            print(f"📄 Страница {page}: найдено {len(vacancy_cards)} карточек.")
+
+            for card in vacancy_cards:
+                if current_count >= target_total:
+                    break
+
+                # Извлекаем заголовок и ссылку
+                title_elem = card.find(class_="vacancy-card__title")
+                if not title_elem:
+                    title_elem = card.find(class_="vacancy-card__title-link")
+
+                if not title_elem:
+                    continue
+                title = title_elem.get_text().strip()
+
+                link_elem = title_elem.find("a") if title_elem.name != "a" else title_elem
+                if not link_elem:
+                    continue
+                link = "https://career.habr.com" + link_elem["href"]
+                v_id = link.split("/")[-1].split("?")[0]
+
+                # ИСПРАВЛЕНИЕ: Бронированный и тего-независимый поиск компании
+                company_elem = card.find(class_="vacancy-card__company")
+                if not company_elem:
+                    company_elem = card.find(class_="vacancy-card__company-title")
+
+                if company_elem:
+                    company = company_elem.get_text().strip()
+                else:
+                    # Резервный поиск ссылки на профиль компании
+                    comp_link = card.find("a", href=lambda h: h and "/companies/" in h)
+                    company = comp_link.get_text().strip() if comp_link else "Не указана"
+
+                # Считываем навыки
+                skills_elem = card.find(class_="vacancy-card__skills")
+                if skills_elem:
+                    skills_list = [el.get_text().strip() for el in skills_elem.find_all(["a", "span"])]
+                    skills_list = list(dict.fromkeys([s for s in skills_list if s]))  # чистим дубли
+                    skills = ", ".join(skills_list)
+                else:
+                    skills = ""
+
+                # Считываем опыт работы
+                meta_elem = card.find(class_="vacancy-card__meta")
+                experience = meta_elem.get_text().strip() if meta_elem else "Не указан"
+
+                # Считываем зарплату
+                salary_elem = card.find(class_="vacancy-card__salary")
+                salary = salary_elem.get_text().strip() if salary_elem else "ЗП не указана"
+
+                # ПРОВЕРКА ДУБЛИКАТОВ И РЕЖИМ АВТО-ИСПРАВЛЕНИЯ КОМПАНИЙ
+                cursor.execute("SELECT company, skills, experience FROM vacancies WHERE id = ?", (v_id,))
+                db_row = cursor.fetchone()
+
+                if db_row:
+                    db_company, db_skills, db_experience = db_row
+
+                    # Проверяем, нужно ли восстановить "Не указана" / пустые поля для уже скачанной вакансии
+                    needs_repair = False
+                    repair_fields = []
+                    repair_params = []
+
+                    if (db_company is None or db_company == "Не указана") and company != "Не указана":
+                        repair_fields.append("company = ?")
+                        repair_params.append(company)
+                        needs_repair = True
+
+                    if (db_skills is None or db_skills == "") and skills != "":
+                        repair_fields.append("skills = ?")
+                        repair_params.append(skills)
+                        needs_repair = True
+
+                    if (db_experience is None or db_experience == "Не указан") and experience != "Не указан":
+                        repair_fields.append("experience = ?")
+                        repair_params.append(experience)
+                        needs_repair = True
+
+                    if needs_repair:
+                        repair_params.append(v_id)
+                        cursor.execute(
+                            f"UPDATE vacancies SET {', '.join(repair_fields)} WHERE id = ?",
+                            tuple(repair_params)
+                        )
+                        conn.commit()
+                        print(f"  ⚡ [АВТО-ИСПРАВЛЕНИЕ] Заполнено для '{title}': компания -> '{company}'")
+
+                    # Переходим к следующей вакансии БЕЗ ожидания и загрузки страницы описания (экономит 100% времени)
+                    continue
+
+                # Если вакансия абсолютно новая — делаем бережную паузу и качаем описание
+                time.sleep(1.5)
+                description = parse_single_vacancy_page(link)
+
+                # Пишем в БД полностью заполненную строку
+                cursor.execute(
+                    """INSERT OR IGNORE INTO vacancies (id, title, company, salary, experience, skills, description, link) 
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (v_id, title, company, salary, experience, skills, description, link)
+                )
+                conn.commit()
+
+                current_count += 1
+                print(f"  -> Успешно докачано [{current_count}]: {title}")
+
+            page += 1
+
+        except Exception as e:
+            print(f"⚠️ Ошибка на странице {page}: {e}")
+            time.sleep(5)
+            break
+
     conn.close()
-    print(f"\n🎉 Миссия выполнена! База успешно расширена до {current_count} вакансий.")
+    print(f"\n🎉 Сбор и авто-исправление успешно завершены! Уникальных вакансий: {current_count}")
 
 
 if __name__ == "__main__":
-    deep_mass_parse(1000)
+    deep_mass_parse(2500)
