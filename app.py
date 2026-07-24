@@ -28,7 +28,9 @@ st.markdown("""
 # --------------------------------------------------------
 def parse_real_salary(val):
     """Вытаскивает из текста вакансии реальную среднюю зарплату в рублях."""
-    if pd.isna(val) or not isinstance(val, str):
+    if pd.isna(val) or not isinstance(
+        val, str
+    ):
         return None
 
     val = val.lower().strip()
@@ -131,8 +133,17 @@ def detect_technologies(title: str):
         "Android": r'\bandroid\b',
         "iOS": r'\bios\b',
         "Analyst": r'\b(аналитик|analyst|analysis|analytics)\b',
-        "Sysadmin / Support": r'\b(sysadmin|системный администратор|администратор linux|сисадмин|сервисный инженер|инженер технической поддержки|инженер проактивного мониторинга|support|поддержка|дежурный|первая линия)\b',
-        "Marketing / PM": r'\b(маркетолог|маркетинг|менеджер|manager|project manager|администратор проектов|cvm|digital)\b'
+        "Sysadmin / Support": (
+            r'\b(sysadmin|системный администратор|администратор linux|'
+            r'сисадмин|сервисный инженер|'
+            r'инженер технической поддержки|'
+            r'инженер проактивного мониторинга|support|поддержка|дежурный|'
+            r'первая линия)\b'
+        ),
+        "Marketing / PM": (
+            r'\b(маркетолог|маркетинг|менеджер|manager|project manager|'
+            r'администратор проектов|cvm|digital)\b'
+        )
     }
 
     matched = []
@@ -150,7 +161,7 @@ def detect_technologies(title: str):
 # Применяем классификацию
 df["technology"] = df["title"].apply(detect_technologies)
 
-# ИСПРАВЛЕНИЕ: Обязательно распаковываем списки в строки перед группировкой!
+# Распаковываем списки в строки перед группировкой
 df_exploded = df.explode("technology")
 
 # --------------------------------------------------------
@@ -159,7 +170,7 @@ df_exploded = df.explode("technology")
 grade_map = {"Junior": 1, "Middle": 2, "Senior": 3}
 df_exploded['grade_num'] = df_exploded['ai_grade'].map(grade_map)
 
-# Агрегируем данные по уникальным комбинациям технология + грейд из РАСПАКОВАННОГО датафрейма
+# Агрегируем данные по уникальным комбинациям технология + грейд
 global_stats = df_exploded.groupby(['technology', 'ai_grade']).agg(
     count=('title', 'count'),
     avg_salary=('salary_score', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
@@ -234,6 +245,68 @@ selected_stat = selected_stat.iloc[0]
 st.subheader(f"{technology} • {grade}")
 
 # --------------------------------------------------------
+# ИНТЕРАКТИВНЫЙ БЛОК ROADMAP И ОПИСАНИЯ ПРОФЕССИЙ
+# --------------------------------------------------------
+DESCRIPTIONS = {
+    "DevOps": "Специалист, объединяющий разработку (Dev) и ИТ-обслуживание (Ops). Настраивает CI/CD и автоматизирует процессы.",
+    "QA": "Инженер по обеспечению качества. Занимается ручным или автоматизированным тестированием ПО.",
+    "Data Scientist": "Специалист по работе с данными. Строит предсказательные модели, анализирует большие объемы информации.",
+    "ML": "Инженер машинного обучения. Разрабатывает и обучает нейросети и алгоритмы ИИ.",
+    "Python": "Python-разработчик. Создает backend, скрипты, работает с данными и автоматизацией.",
+    "Java": "Java-разработчик. Пишет надежный backend для энтерпрайз-систем и банковского сектора.",
+    "JavaScript": "JS-разработчик (чаще Frontend). Создает интерактивные веб-интерфейсы и SPA.",
+    "TypeScript": "TS-разработчик. Пишет строго типизированный код для современных веб-приложений.",
+    "Go": "Go-разработчик. Создает высоконагруженные, быстрые и масштабируемые микросервисы.",
+    "C#": "C#/.NET-разработчик. Разрабатывает приложения под экосистему Microsoft, игры и backend.",
+    "C++": "C++ разработчик. Создает высокопроизводительные системы, движки, системное ПО.",
+    "PHP": "PHP-разработчик. Классический backend для веб-сайтов и CMS-систем.",
+    "Kotlin": "Kotlin-разработчик. Пишет современные приложения для Android и backend-сервисы.",
+    "Swift": "Swift-разработчик. Создает нативные мобильные приложения для iOS и экосистемы Apple.",
+    "Rust": "Rust-разработчик. Пишет безопасный и быстрый системный код, микросервисы, Web3.",
+    "Scala": "Scala-разработчик. Создает распределенные системы и работает с Big Data.",
+    "Ruby": "Ruby (Ruby on Rails) разработчик. Быстро прототипирует и создает веб-приложения.",
+    "Dart": "Dart/Flutter-разработчик. Создает кроссплатформенные мобильные приложения (iOS и Android).",
+    "1C": "1С-разработчик. Автоматизирует бизнес-процессы и учет на базе платформы 1С:Предприятие.",
+    "Android": "Android-разработчик. Разрабатывает мобильные приложения под ОС Android (обычно Java/Kotlin).",
+    "iOS": "iOS-разработчик. Создает мобильные приложения для iPhone и iPad (Objective-C/Swift).",
+    "Analyst": "Аналитик (системный, бизнес, данных). Собирает требования, проектирует архитектуру или анализирует метрики.",
+    "Sysadmin / Support": "Системный администратор / Инженер поддержки. Обеспечивает работу инфраструктуры и помогает пользователям.",
+    "Marketing / PM": "Маркетолог / Менеджер проектов. Управляет командой, продуктом, маркетингом и процессами разработки.",
+    "Other": "Другие ИТ-специалисты, не вошедшие в основные категории."
+}
+
+st.markdown(f"*{DESCRIPTIONS.get(technology, '')}*")
+
+ROADMAPS = {
+    "DevOps": "https://roadmap.sh/devops",
+    "QA": "https://roadmap.sh/qa",
+    "Data Scientist": "https://roadmap.sh/ai-data-scientist",
+    "ML": "https://roadmap.sh/ai-data-scientist",
+    "Python": "https://roadmap.sh/python",
+    "Java": "https://roadmap.sh/java",
+    "JavaScript": "https://roadmap.sh/javascript",
+    "TypeScript": "https://roadmap.sh/typescript",
+    "Go": "https://roadmap.sh/golang",
+    "C++": "https://roadmap.sh/cpp",
+    "Android": "https://roadmap.sh/android",
+    "iOS": "https://roadmap.sh/ios",
+    "PHP": "https://roadmap.sh/php",
+    "Swift": "https://roadmap.sh/ios",
+    "Ruby": "https://roadmap.sh/ruby",
+    "C#": "https://roadmap.sh/aspnet-core",
+    "Kotlin": "https://roadmap.sh/android",
+    "Rust": "https://roadmap.sh/rust",
+    "Dart": "https://roadmap.sh/flutter",
+    "Analyst": "https://roadmap.sh/data-analyst"
+}
+
+roadmap_url = ROADMAPS.get(technology, "https://roadmap.sh")
+st.info(
+    f"🎓 **Хочешь прокачаться?** Посмотри [пошаговый Roadmap "
+    f"(карту развития) для {technology}]({roadmap_url})"
+)
+
+# --------------------------------------------------------
 # ИЗВЛЕЧЕНИЕ РАССЧИТАННЫХ ДАННЫХ
 # --------------------------------------------------------
 
@@ -256,11 +329,9 @@ k_score = selected_stat['k_score']
 # --------------------------------------------------------
 is_estimated = False
 if pd.notna(avg_real_salary) and avg_real_salary > 0:
-    # Округляем до тысяч реальную спарсенную зарплату
     rounded_salary = int(round(avg_real_salary / 1000) * 1000)
     salary_display = f"{rounded_salary:,} ₽".replace(",", " ")
 else:
-    # Умное прогнозирование на основе оценки ИИ (Salary Score)
     estimated_salary = int(30000 + (avg_salary - 1) * 45000)
     estimated_salary = int(round(estimated_salary / 5000) * 5000)
     salary_display = f"~ {estimated_salary:,} ₽ *".replace(",", " ")
@@ -364,7 +435,7 @@ else:
 st.divider()
 
 # --------------------------------------------------------
-# ТОП КОМПАНИЙ (С ОЧИСТКОЙ ОТ "Не указана")
+# ТОП КОМПАНИЙ
 # --------------------------------------------------------
 
 st.subheader("🏢 Компании, которые чаще всего ищут специалистов")
@@ -405,20 +476,26 @@ st.divider()
 
 st.subheader("📄 Найденные вакансии")
 
+filtered["mini_desc"] = filtered["description"].apply(
+    lambda x: (str(x)[:120] + "...") if pd.notna(x) and len(str(x)) > 120 else str(x)
+)
+
 table = filtered[[
     "title",
     "company",
     "salary",
+    "mini_desc",
     "salary_score",
     "competition_score",
     "requirements_density",
     "link"
-]].drop_duplicates(subset=["link"])  # Убираем дубли ссылок из-за explode
+]].drop_duplicates(subset=["link"])
 
 table.columns = [
     "Название",
     "Компания",
     "Зарплата (текст)",
+    "Краткое описание",
     "Оценка ИИ: Зарплата",
     "Оценка ИИ: Конкуренция",
     "Оценка ИИ: Требования",
@@ -428,7 +505,11 @@ table.columns = [
 st.dataframe(
     table,
     use_container_width=True,
-    hide_index=True
+    hide_index=True,
+    column_config={
+        "Ссылка": st.column_config.LinkColumn("Ссылка", display_text="Открыть на Хабре"),
+        "Краткое описание": st.column_config.TextColumn("Краткое описание", width="large")
+    }
 )
 
 st.divider()
