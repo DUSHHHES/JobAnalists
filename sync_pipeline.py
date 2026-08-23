@@ -3,63 +3,20 @@ import time
 import datetime
 import requests
 import bs4
-import json
-import sys
 
-DB_NAME = "habr_analytics.db"
-OLLAMA_URL = "http://localhost:11434"
-
-# Модель по умолчанию для ИИ-разметки
-DEFAULT_AI_MODEL = "qwen2.5:7b"
+from config import DB_NAME, DEFAULT_AI_MODEL, SOFT_DELETE_THRESHOLD_DAYS, HABR_HEADERS, REQUEST_TIMEOUT
+from database import init_db_schema
+from web_parser import fetch_description_from_url
+from ollama_client import select_model
+from ai_enricher import run_ai_labeling
 
 
 # --------------------------------------------------------------------------
 # 1. ИНИЦИАЛИЗАЦИЯ И МИГРАЦИЯ СХЕМЫ БАЗЫ ДАННЫХ
 # --------------------------------------------------------------------------
 
-def init_enhanced_db():
-    """
-    Создает или дополняет схему SQLite всеми служебными полями:
-    - Жизненный цикл: status ('active'/'closed'), first_seen, last_seen
-    - Версионирование ИИ: ai_version, ai_processed_at
-    - Оценки ИИ: requirements_density, salary_score, competition_score, ai_grade
-    """
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS vacancies (
-            id TEXT PRIMARY KEY,
-            title TEXT,
-            company TEXT,
-            salary TEXT,
-            experience TEXT,
-            skills TEXT,
-            description TEXT,
-            link TEXT
-        )
-    """)
-
-    required_columns = [
-        ("first_seen", "TEXT"),
-        ("last_seen", "TEXT"),
-        ("status", "TEXT DEFAULT 'active'"),
-        ("requirements_density", "INTEGER"),
-        ("salary_score", "INTEGER"),
-        ("competition_score", "INTEGER"),
-        ("ai_grade", "TEXT"),
-        ("ai_version", "TEXT"),
-        ("ai_processed_at", "TEXT")
-    ]
-
-    for col_name, col_type in required_columns:
-        try:
-            cursor.execute(f"ALTER TABLE vacancies ADD COLUMN {col_name} {col_type}")
-        except sqlite3.OperationalError:
-            pass  # Колонка уже существует
-
-    conn.commit()
-    conn.close()
+# Инициализация БД теперь используется из модуля database.py
+# init_enhanced_db() заменена на init_db_schema()
 
 
 # --------------------------------------------------------------------------
@@ -71,9 +28,6 @@ def fetch_all_cards_from_site():
     Бесконечный скан страниц Хабра до полного исчерпания ленты.
     Возвращает список базовых данных карточек.
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
 
     cards_data = []
     page = 1
@@ -81,9 +35,9 @@ def fetch_all_cards_from_site():
     print("🌐 [ЭТАП 1/4] Быстрый скан ленты Хабр Карьеры (до конца списка)...")
 
     while True:
-        url = f"[https://career.habr.com/vacancies?type=all&page=](https://career.habr.com/vacancies?type=all&page=){page}"
+        url = f"https://career.habr.com/vacancies?type=all&page={page}"
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = requests.get(url, headers=HABR_HEADERS, timeout=REQUEST_TIMEOUT)
             if response.status_code != 200:
                 print(f"⚠️ Ответ сервера {response.status_code} на странице {page}. Остановка скана.")
                 break
@@ -106,7 +60,7 @@ def fetch_all_cards_from_site():
                 if not link_elem:
                     continue
 
-                link = "[https://career.habr.com](https://career.habr.com)" + link_elem["href"]
+                link = "https://career.habr.com" + link_elem["href"]
                 v_id = link.split("/")[-1].split("?")[0]
                 title = title_elem.get_text().strip()
 
@@ -147,26 +101,10 @@ def fetch_all_cards_from_site():
 # --------------------------------------------------------------------------
 # 3. ФАЗА 2: СИНХРОНИЗАЦИЯ С БД И СКАЧИВАНИЕ НОВЫХ/ИЗМЕНЕННЫХ
 # --------------------------------------------------------------------------
+# 3. ФАЗА 2: СИНХРОНИЗАЦИЯ С БД И СКАЧИВАНИЕ НОВЫХ/ИЗМЕНЁННЫХ
+# --------------------------------------------------------------------------
 
-def fetch_vacancy_description(link):
-    """Точечно загружает подробный текст описания вакансии с Хабра."""
-    if not link or not isinstance(link, str) or not link.startswith("http"):
-        return ""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    try:
-        res = requests.get(link, headers=headers, timeout=10)
-        if res.status_code == 200:
-            soup = bs4.BeautifulSoup(res.text, "html.parser")
-            block = soup.find("div", class_="vacancy-description") or soup.find("div",
-                                                                                class_="style-html") or soup.find("div",
-                                                                                                                  class_="vacancy-description__text")
-            return block.get_text(separator=" ").strip() if block else ""
-    except Exception:
-        pass
-    return ""
-
+# fetch_vacancy_description() теперь импортирована из web_parser.py как fetch_description_from_url
 
 def sync_cards_with_db(cards_data):
     """
@@ -184,16 +122,17 @@ def sync_cards_with_db(cards_data):
     new_count = 0
     updated_count = 0
 
+    cursor.execute("SELECT id, title, salary FROM vacancies")
+    existing = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
     for card in cards_data:
         v_id = card["id"]
-
-        cursor.execute("SELECT title, salary FROM vacancies WHERE id = ?", (v_id,))
-        row = cursor.fetchone()
+        row = existing.get(v_id)
 
         if not row:
             # 1. Абсолютно новая вакансия
             time.sleep(0.8)
-            desc = fetch_vacancy_description(card["link"])
+            desc = fetch_description_from_url(card["link"])
 
             cursor.execute("""
                 INSERT INTO vacancies 
@@ -211,7 +150,7 @@ def sync_cards_with_db(cards_data):
             # 2. Проверка изменений в содержании
             if old_title != card["title"] or old_salary != card["salary"]:
                 time.sleep(0.8)
-                desc = fetch_vacancy_description(card["link"])
+                desc = fetch_description_from_url(card["link"])
 
                 cursor.execute("""
                     UPDATE vacancies 
@@ -271,27 +210,17 @@ def apply_soft_delete(days_threshold=14):
 # 5. ФАЗА 4: ИИ-РАЗМЕТКА С ВЕРСИОНИРОВАНИЕМ И АВТОДОКАЧКОЙ ОПИСАНИЙ
 # --------------------------------------------------------------------------
 
-def get_active_ollama_model():
-    """Проверяет доступность Ollama и возвращает целевую модель Qwen."""
-    try:
-        res = requests.get(f"{OLLAMA_URL}/api/tags", timeout=3)
-        if res.status_code == 200:
-            models = [m["name"] for m in res.json().get("models", [])]
-            if models:
-                matching = next((m for m in models if DEFAULT_AI_MODEL in m), None)
-                return matching if matching else models[0]
-    except Exception:
-        pass
-    return None
-
+# get_active_ollama_model() теперь заменена на select_model() из ollama_client.py
 
 def run_ai_enrichment():
     """
     Размечает вакансии через Ollama с автодокачкой описаний при необходимости,
     записывая ai_version и ai_processed_at.
     """
-    model_name = get_active_ollama_model()
-    if not model_name:
+    # Проверка доступности Ollama
+    try:
+        model_name = select_model(DEFAULT_AI_MODEL)
+    except SystemExit:
         print("\n⚠️ Сервер Ollama недоступен или нет моделей. Этап ИИ-анализа пропущен.")
         return
 
@@ -319,223 +248,7 @@ def run_ai_enrichment():
     print(f"\n🤖 [ЭТАП 4/4] Запуск ИИ-анализа для {len(unprocessed)} вакансий...")
     print(f"🏷 Используемая модель: '{model_name}'")
 
-    system_prompt = """
-Ты — строгий HR-аналитик и эксперт по анализу IT-вакансий.
-
-Проанализируй описание вакансии и оцени параметры строго по указанным критериям.
-
-Используй только информацию, содержащуюся в тексте вакансии.
-Не додумывай отсутствующие факты.
-Если информации недостаточно, выставляй среднюю оценку (5), а не пытайся угадывать.
-
-===========================================================
-1. "salary_score" — Оценка заработной платы и условий труда
-===========================================================
-
-Оцени привлекательность финансовых условий по шкале от 1 до 10.
-
-1–3
-• зарплата ниже рынка;
-• неоплачиваемая стажировка;
-• минимальный соцпакет;
-• штрафы;
-• неблагоприятные условия.
-
-4–7
-• среднерыночная зарплата;
-• стандартный социальный пакет;
-• обычные условия труда.
-
-8–10
-• зарплата значительно выше рынка;
-• бонусы;
-• премии;
-• опционы;
-• расширенный ДМС;
-• дополнительные льготы.
-
-Если размер зарплаты отсутствует и нет достаточной информации для оценки,
-верни значение 5.
-
-===========================================================
-2. "requirements_density" — Плотность требований
-===========================================================
-
-Оцени сложность вакансии и объём обязательных требований.
-
-1–3
-• минимальный стек технологий;
-• небольшой список требований;
-• одна область ответственности.
-
-4–7
-• типичный стек технологий;
-• несколько обязательных навыков;
-• стандартные требования к специалисту.
-
-8–10
-• очень широкий стек;
-• большое количество обязательных технологий;
-• DevOps, архитектура, CI/CD, облака;
-• совмещение нескольких ролей;
-• высокие требования к опыту.
-
-===========================================================
-3. "competition_score" — Предполагаемая конкуренция среди соискателей
-===========================================================
-
-Оцени вероятность того, что на данную вакансию будет большое количество подходящих кандидатов.
-
-При оценке учитывай СОВОКУПНОСТЬ следующих факторов:
-
-• уровень квалификации;
-• распространённость используемых технологий;
-• редкость специализации;
-• сложность требований;
-• количество обязательных навыков;
-• широту технологического стека;
-• предполагаемый порог входа.
-
-Не определяй оценку только по уровню Junior/Middle/Senior.
-
-Шкала:
-
-1–3
-• очень низкая конкуренция;
-• редкая специализация;
-• уникальный стек;
-• высокий порог входа;
-• сложные требования;
-• мало потенциальных кандидатов.
-
-4–7
-• средняя конкуренция;
-• типичная IT-вакансия;
-• распространённые технологии;
-• стандартные требования.
-
-8–10
-• высокая конкуренция;
-• массовая позиция;
-• распространённые технологии;
-• невысокий порог входа;
-• большое количество потенциальных кандидатов.
-
-===========================================================
-4. "ai_grade" — Уровень специалиста
-===========================================================
-
-Определи требуемый уровень квалификации:
-
-• Junior
-• Middle
-• Senior
-
-Используй совокупность требований вакансии, ожидаемого опыта,
-самостоятельности и уровня ответственности.
-
-===========================================================
-ПРАВИЛА ОТВЕТА
-===========================================================
-
-Верни ТОЛЬКО один валидный JSON-объект.
-
-Не добавляй:
-- пояснений;
-- комментариев;
-- Markdown;
-- ```json;
-- любого текста до или после JSON.
-
-Формат ответа:
-
-{
-  "salary_score": 5,
-  "requirements_density": 5,
-  "competition_score": 5,
-  "ai_grade": "Middle"
-}
-"""
-
-    for idx, (v_id, title, desc, link) in enumerate(unprocessed, 1):
-        # ⚡ АВТОДОКАЧКА: Если описание отсутствует или короткое — скачиваем его прямо сейчас
-        if not desc or len(desc.strip()) < 15:
-            print(f" [{idx}/{len(unprocessed)}] ⚡ Докачиваю описание: {title[:35]}...", end="", flush=True)
-            time.sleep(0.8)
-            desc = fetch_vacancy_description(link)
-
-            if desc and len(desc.strip()) >= 15:
-                conn_tmp = sqlite3.connect(DB_NAME)
-                c_tmp = conn_tmp.cursor()
-                c_tmp.execute("UPDATE vacancies SET description = ? WHERE id = ?", (desc, v_id))
-                conn_tmp.commit()
-                conn_tmp.close()
-                print(" УСПЕШНО")
-            else:
-                conn_tmp = sqlite3.connect(DB_NAME)
-                c_tmp = conn_tmp.cursor()
-                c_tmp.execute("UPDATE vacancies SET ai_grade = 'EMPTY' WHERE id = ?", (v_id,))
-                conn_tmp.commit()
-                conn_tmp.close()
-                print(" ❌ Не удалось скачать (пропуск)")
-                continue
-
-        print(f" [{idx}/{len(unprocessed)}] {model_name} анализирует: {title[:35]}...", end="", flush=True)
-
-        user_content = f"Название вакансии: {title}\nОписание вакансии:\n{desc[:5000]}"
-
-        payload = {
-            "model": model_name,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ],
-            "stream": False,
-            "format": "json",
-            "options": {"temperature": 0.0}
-        }
-
-        try:
-            res = requests.post(f"{OLLAMA_URL}/api/chat", json=payload, timeout=45)
-            if res.status_code == 200:
-                raw_json = res.json()["message"]["content"].strip()
-
-                if raw_json.startswith("```"):
-                    lines = raw_json.split("\n")
-                    if lines[0].startswith("```"):
-                        lines = lines[1:]
-                    if lines[-1].startswith("```"):
-                        lines = lines[:-1]
-                    raw_json = "\n".join(lines).strip()
-
-                data = json.loads(raw_json)
-
-                salary = int(data.get('salary_score', 5))
-                density = int(data.get('requirements_density', 5))
-                comp = int(data.get('competition_score', 5))
-                grade = str(data.get('ai_grade', 'Middle'))
-                if grade not in ['Junior', 'Middle', 'Senior']:
-                    grade = 'Middle'
-
-                now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                conn_upd = sqlite3.connect(DB_NAME)
-                c_upd = conn_upd.cursor()
-                c_upd.execute("""
-                    UPDATE vacancies 
-                    SET requirements_density = ?, salary_score = ?, competition_score = ?, ai_grade = ?,
-                        ai_version = ?, ai_processed_at = ?
-                    WHERE id = ?
-                """, (density, salary, comp, grade, model_name, now_ts, v_id))
-                conn_upd.commit()
-                conn_upd.close()
-                print(" OK")
-            else:
-                print(" ❌ Ошибка API")
-        except Exception as e:
-            print(f" ❌ Ошибка: {e}")
-
-    print("🎉 ИИ-разметка успешно завершена!")
+    run_ai_labeling(unprocessed, model_name)
 
 
 # --------------------------------------------------------------------------
@@ -544,22 +257,14 @@ def run_ai_enrichment():
 
 def print_db_summary():
     """Выводит сводку состояния базы данных."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+    # Используем функцию из database.py
+    from database import get_db_summary as get_summary
+    stats = get_summary()
 
-    cursor.execute("SELECT COUNT(*) FROM vacancies")
-    total = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM vacancies WHERE status = 'active'")
-    active = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM vacancies WHERE ai_grade IN ('Junior','Middle','Senior')")
-    analyzed = cursor.fetchone()[0]
-
-    cursor.execute("SELECT ai_version, COUNT(*) FROM vacancies WHERE ai_version IS NOT NULL GROUP BY ai_version")
-    versions = cursor.fetchall()
-
-    conn.close()
+    total = stats['total']
+    active = stats['active']
+    analyzed = stats['analyzed']
+    versions = stats['versions']
 
     print("\n📊 ИТОГОВАЯ СТАТИСТИКА БАЗЫ ДАННЫХ:")
     print(f"  • Всего вакансий в базе: {total}")
@@ -576,13 +281,13 @@ def update_database():
     print("🚀 ЕДИНЫЙ ПАЙПЛАЙН СИНХРОНИЗАЦИИ И АНАЛИЗА БАЗЫ ДАННЫХ")
     print("==================================================================\n")
 
-    init_enhanced_db()
+    init_db_schema()
     cards = fetch_all_cards_from_site()
 
     if cards:
         sync_cards_with_db(cards)
 
-    apply_soft_delete(days_threshold=14)
+    apply_soft_delete(days_threshold=SOFT_DELETE_THRESHOLD_DAYS)
     run_ai_enrichment()
     print_db_summary()
 

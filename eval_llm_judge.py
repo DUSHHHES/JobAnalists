@@ -1,54 +1,17 @@
-import sqlite3
-import json
 import sys
 import pandas as pd
 import numpy as np
 import requests
 
-DB_NAME = "habr_analytics.db"
-
-# Адрес локального сервера Ollama
-OLLAMA_URL = "http://localhost:11434/api/chat"
-
-# Модель-Арбитр из твоего списка скачанных моделей
-JUDGE_MODEL = "qwen2.5:7b"
-
-# Размер контрольной случайной выборки для проверки
-SAMPLE_SIZE = 30
-
-
-def fetch_annotated_sample(sample_size=30):
-    """Выбирает из базы случайную выборку вакансий, которые уже размечены основной моделью."""
-    conn = sqlite3.connect(DB_NAME)
-    query = """
-        SELECT id, title, description, salary_score, requirements_density, competition_score, ai_grade
-        FROM vacancies
-        WHERE ai_grade IN ('Junior', 'Middle', 'Senior')
-          AND salary_score IS NOT NULL
-          AND requirements_density IS NOT NULL
-          AND competition_score IS NOT NULL
-    """
-    try:
-        df = pd.read_sql(query, conn)
-    except Exception as e:
-        print(f"❌ Ошибка чтения из БД: {e}")
-        conn.close()
-        return None
-    conn.close()
-
-    if len(df) == 0:
-        print("❌ В базе нет размеченных вакансий для сравнения!")
-        print("Сначала запусти ai_enricher.py, чтобы раз разметить вакансии основной моделью.")
-        return None
-
-    actual_sample_size = min(sample_size, len(df))
-    sample_df = df.sample(n=actual_sample_size, random_state=42).copy()
-    return sample_df
+from config import OLLAMA_URL, JUDGE_MODEL, SAMPLE_SIZE, VALID_GRADES
+from database import get_annotated_sample
+from ollama_client import query_ollama, parse_model_json
 
 
 def get_judge_evaluation_ollama(title, description, model_name=JUDGE_MODEL):
     """
     Отправляет вакансию независимой моделью-арбитру Qwen 2.5 7B через Ollama.
+    Использует функцию query_ollama из ollama_client.py
     """
     system_prompt = """Ты — независимый эксперт-аудитор HR-данных. Проанализируй текст IT-вакансии.
 Оцени параметры строго по шкале от 1 до 10:
@@ -69,43 +32,27 @@ def get_judge_evaluation_ollama(title, description, model_name=JUDGE_MODEL):
     short_desc = description[:5000] if description else ""
     user_content = f"Вакансия: {title}\nОписание:\n{short_desc}"
 
-    payload = {
-        "model": model_name,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ],
-        "stream": False,
-        "format": "json",
-        "options": {"temperature": 0.0}
-    }
+    raw_json = query_ollama(model_name, system_prompt, user_content)
 
-    try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=40)
+    data = parse_model_json(raw_json)
 
-        if response.status_code == 404:
-            print(f"\n❌ Модель '{model_name}' не найдена в Ollama!")
-            return None
-
-        if response.status_code != 200:
-            return None
-
-        result_data = response.json()
-        raw_json = result_data["message"]["content"].strip()
-        data = json.loads(raw_json)
-
-        grade = str(data.get('ai_grade', 'Middle'))
-        if grade not in ['Junior', 'Middle', 'Senior']:
-            grade = 'Middle'
-
-        return {
-            "salary_score": int(data.get('salary_score', 5)),
-            "requirements_density": int(data.get('requirements_density', 5)),
-            "competition_score": int(data.get('competition_score', 5)),
-            "ai_grade": grade
-        }
-    except Exception:
+    if data is None:
         return None
+
+    salary = int(data.get('salary_score', 5))
+    density = int(data.get('requirements_density', 5))
+    comp = int(data.get('competition_score', 5))
+    grade = str(data.get('ai_grade', 'Middle'))
+
+    if grade not in VALID_GRADES:
+        grade = 'Middle'
+
+    return {
+        "salary_score": salary,
+        "requirements_density": density,
+        "competition_score": comp,
+        "ai_grade": grade
+    }
 
 
 def run_llm_cross_validation():
@@ -115,13 +62,13 @@ def run_llm_cross_validation():
 
     # 1. Проверяем доступность локального сервера Ollama
     try:
-        requests.get("http://localhost:11434/", timeout=3)
+        requests.get(f"{OLLAMA_URL}/", timeout=3)
     except requests.exceptions.ConnectionError:
         print("❌ Сервер Ollama не запущен! Убедись, что выполняется 'ollama serve'.")
         sys.exit(1)
 
     # 2. Формируем тестовую выборку
-    sample_df = fetch_annotated_sample(SAMPLE_SIZE)
+    sample_df = get_annotated_sample(SAMPLE_SIZE)
     if sample_df is None:
         return
 

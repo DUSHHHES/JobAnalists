@@ -1,16 +1,15 @@
-import sqlite3
-import re
 import pandas as pd
-import numpy as np
 
-DB_NAME = "habr_analytics.db"
+from config import COMPLETENESS_THRESHOLD, VARIANCE_THRESHOLD, SCORE_MIN, SCORE_MAX, VALID_GRADES
+from database import get_connection
+
 
 def run_data_validation():
     print("==================================================")
     print("🧪 АВТОМАТИЧЕСКАЯ ПРОВЕРКА КАЧЕСТВА ДАННЫХ (DQA)")
     print("==================================================\n")
 
-    conn = sqlite3.connect(DB_NAME)
+    conn = get_connection()
     df = pd.read_sql("SELECT * FROM vacancies", conn)
     conn.close()
 
@@ -31,7 +30,7 @@ def run_data_validation():
 
     print(f"Размечено вакансий: {analyzed_count} из {total_records} ({completeness_rate:.1f}%)")
 
-    if completeness_rate < 80:
+    if completeness_rate < COMPLETENESS_THRESHOLD:
         print("⚠️ ВНИМАНИЕ: Менее 80% базы размечено. Рекомендуется доразметить вакансии.")
     else:
         print("✅ Отличный уровень покрытия данными!")
@@ -47,14 +46,14 @@ def run_data_validation():
     for col in score_columns:
         if col in analyzed_df.columns:
             out_of_bounds = analyzed_df[
-                (analyzed_df[col] < 1) | (analyzed_df[col] > 10) | (analyzed_df[col].isna())
+            (analyzed_df[col] < SCORE_MIN) | (analyzed_df[col] > SCORE_MAX) | (analyzed_df[col].isna())
                 ]
             count_invalid = len(out_of_bounds)
             if count_invalid > 0:
                 print(f"❌ Колонка '{col}': найдено {count_invalid} некорректных значений!")
                 invalid_scores += count_invalid
             else:
-                print(f"✅ Колонка '{col}': все значения строго в диапазоне 1..10")
+                                print(f"✅ Колонка '{col}': все значения строго в диапазоне {SCORE_MIN}..{SCORE_MAX}")
 
     # ----------------------------------------------------
     # ТЕСТ 3: Проверка смысловых противоречий (Consistency Checks)
@@ -96,7 +95,7 @@ def run_data_validation():
             mean_val = analyzed_df[col].mean()
             print(f"📊 '{col}': Среднее = {mean_val:.2f}, Стд. отклонение = {std_val:.2f}")
 
-            if std_val < 0.8:
+            if std_val < VARIANCE_THRESHOLD:
                 print(
                     f"⚠️ ВНИМАНИЕ: Слишком низкая дисперсия в '{col}'! ИИ ставит почти одинаковые оценки всем вакансиям.")
             else:

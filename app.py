@@ -1,10 +1,17 @@
-import sqlite3
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 from collections import Counter
-import re
+
+from utils import (
+    parse_real_salary,
+    detect_technologies,
+    extract_skills,
+    build_salary_calibration,
+    estimate_hidden_salary,
+)
+from database import get_connection
 
 # --------------------------------------------------------
 # НАСТРОЙКИ СТРАНИЦЫ
@@ -24,51 +31,12 @@ st.markdown("""
 
 
 # --------------------------------------------------------
-# ФУНКЦИЯ ДЛЯ ПАРСИНГА РЕАЛЬНОЙ ЗАРПЛАТЫ
-# --------------------------------------------------------
-def parse_real_salary(val):
-    """Вытаскивает из текста вакансии реальную среднюю зарплату в рублях."""
-    if pd.isna(val) or not isinstance(
-        val, str
-    ):
-        return None
-
-    val = val.lower().strip()
-    val = re.sub(r'\s+', '', val)
-    val = val.replace('руб', '').replace('р', '').replace('₽', '').replace('бел', '')
-
-    multiplier = 1
-    if '$' in val or 'usd' in val:
-        multiplier = 90
-        val = val.replace('$', '').replace('usd', '')
-    elif '€' in val or 'eur' in val:
-        multiplier = 100
-        val = val.replace('€', '').replace('eur', '')
-
-    numbers = [int(n) for n in re.findall(r'\d+', val)]
-    if not numbers:
-        return None
-
-    avg_num = sum(numbers) / len(numbers)
-
-    if avg_num < 1000:
-        avg_num = avg_num * 1000
-
-    avg_num = avg_num * multiplier
-
-    if avg_num < 15000 or avg_num > 1500000:
-        return None
-
-    return avg_num
-
-
-# --------------------------------------------------------
 # ЗАГРУЗКА ДАННЫХ
 # --------------------------------------------------------
 
 @st.cache_data(ttl=600)  # Кешируем данные на 10 минут
 def load_data():
-    conn = sqlite3.connect("habr_analytics.db")
+    conn = get_connection()
 
     query = """
     SELECT
@@ -93,122 +61,76 @@ def load_data():
 
     # Парсим зарплату в рубли для качественной аналитики
     df["parsed_salary"] = df["salary"].apply(parse_real_salary)
-    return df
+
+    # Калибровочная таблица «ИИ-оценка -> медианная зарплата» по раскрытым вакансиям
+    calibration, market_median = build_salary_calibration(df)
+    return df, calibration, market_median
 
 
-df = load_data()
+df, salary_calibration, market_median = load_data()
 
 if df.empty:
     st.error("В базе нет размеченных вакансий.")
     st.stop()
 
 
-# --------------------------------------------------------
-# ОПРЕДЕЛЕНИЕ ТЕХНОЛОГИИ
-# --------------------------------------------------------
+@st.cache_data(ttl=600)
+def prepare_market_stats(df):
+    data = df.copy()
 
-def detect_technologies(title: str):
-    title = str(title).lower().strip()
+    # Применяем классификацию и распаковываем списки в строки перед группировкой
+    data["technology"] = data["title"].apply(detect_technologies)
+    data = data.explode("technology")
 
-    patterns = {
-        "DevOps": r'\b(devops|sre|dev-ops)\b',
-        "QA": r'\b(qa|tester|test|testing|тестировщик|тестирования|manual|automation)\b',
-        "Data Scientist": r'\b(data scientist|data science|ds|data engineer)\b',
-        "ML": r'\b(machine learning|ml|nlp)\b',
-        "Python": r'\bpython\b',
-        "Java": r'\bjava\b',  # Благодаря \b "java" не совпадет с "javascript"
-        "JavaScript": r'\b(javascript|js|frontend|фронтенд)\b',
-        "TypeScript": r'\b(typescript|ts)\b',
-        "Go": r'\b(go|golang)\b',  # Совпадет с "go", "golang", "go-разработчик"
-        "C#": r'c#|\b\.?net\b|asp\.net',
-        "C++": r'c\+\+',
-        "PHP": r'\bphp\b',
-        "Kotlin": r'\bkotlin\b',
-        "Swift": r'\bswift\b',
-        "Rust": r'\brust\b',
-        "Scala": r'\bscala\b',
-        "Ruby": r'\bruby\b',
-        "Dart": r'\b(dart|flutter)\b',
-        "1C": r'\b1с\b|\b1c\b',
-        "Android": r'\bandroid\b',
-        "iOS": r'\bios\b',
-        "Analyst": r'\b(аналитик|analyst|analysis|analytics)\b',
-        "Sysadmin / Support": (
-            r'\b(sysadmin|системный администратор|администратор linux|'
-            r'сисадмин|сервисный инженер|'
-            r'инженер технической поддержки|'
-            r'инженер проактивного мониторинга|support|поддержка|дежурный|'
-            r'первая линия)\b'
-        ),
-        "Marketing / PM": (
-            r'\b(маркетолог|маркетинг|менеджер|manager|project manager|'
-            r'администратор проектов|cvm|digital)\b'
-        )
-    }
+    # --------------------------------------------------------
+    # ГЛОБАЛЬНЫЙ РАСЧЕТ И НОРМАЛИЗАЦИЯ (ДЛЯ ВСЕГО РЫНКА)
+    # --------------------------------------------------------
+    grade_map = {"Junior": 1, "Middle": 2, "Senior": 3}
+    data['grade_num'] = data['ai_grade'].map(grade_map)
 
-    matched = []
-    for tech, pattern in patterns.items():
-        if re.search(pattern, title, re.IGNORECASE):
-            matched.append(tech)
+    # Агрегируем данные по уникальным комбинациям технология + грейд
+    global_stats = data.groupby(['technology', 'ai_grade']).agg(
+        count=('title', 'count'),
+        avg_salary=('salary_score', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
+        avg_density=('requirements_density', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
+        avg_comp=('competition_score', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
+        avg_real_salary=('parsed_salary', lambda x: x.mean() if pd.notna(x.mean()) else np.nan),
+        grade_num=('grade_num', 'first')
+    ).reset_index()
 
-    # Если ни один паттерн не подошел, определяем в категорию "Other"
-    if not matched:
-        return ["Other"]
+    max_count = global_stats['count'].max()
 
-    return matched
+    # Нормированные переменные для формулы
+    global_stats['Nn'] = np.log(global_stats['count'] + 1) / np.log(max_count + 1)
+    global_stats['Sn'] = global_stats['avg_salary'] / 10
+    global_stats['Dn'] = global_stats['avg_density'] / 10
+    global_stats['Gn'] = global_stats['grade_num'] / 3
+    global_stats['Cn'] = global_stats['avg_comp'] / 10
+
+    # Считаем сырой коэффициент K_raw для всех комбинаций
+    global_stats['k_raw'] = (
+            0.35 * global_stats['Nn'] +
+            0.25 * global_stats['Sn'] +
+            0.20 * global_stats['Dn'] +
+            0.05 * global_stats['Gn'] -
+            0.15 * global_stats['Cn']
+    )
+
+    # Находим глобальные минимумы и максимумы и нормируем от 0 до 100
+    min_k = global_stats['k_raw'].min()
+    max_k = global_stats['k_raw'].max()
+
+    if max_k == min_k:
+        global_stats['k_score'] = 100.0
+    else:
+        global_stats['k_score'] = ((global_stats['k_raw'] - min_k) / (max_k - min_k)) * 100
+
+    global_stats['k_score'] = global_stats['k_score'].round(2)
+
+    return data, global_stats
 
 
-# Применяем классификацию
-df["technology"] = df["title"].apply(detect_technologies)
-
-# Распаковываем списки в строки перед группировкой
-df_exploded = df.explode("technology")
-
-# --------------------------------------------------------
-# ГЛОБАЛЬНЫЙ РАСЧЕТ И НОРМАЛИЗАЦИЯ (ДЛЯ ВСЕГО РЫНКА)
-# --------------------------------------------------------
-grade_map = {"Junior": 1, "Middle": 2, "Senior": 3}
-df_exploded['grade_num'] = df_exploded['ai_grade'].map(grade_map)
-
-# Агрегируем данные по уникальным комбинациям технология + грейд
-global_stats = df_exploded.groupby(['technology', 'ai_grade']).agg(
-    count=('title', 'count'),
-    avg_salary=('salary_score', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
-    avg_density=('requirements_density', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
-    avg_comp=('competition_score', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
-    avg_real_salary=('parsed_salary', lambda x: x.mean() if pd.notna(x.mean()) else np.nan),
-    grade_num=('grade_num', 'first')
-).reset_index()
-
-max_count = global_stats['count'].max()
-
-# Нормированные переменные для формулы
-global_stats['Nn'] = np.log(global_stats['count'] + 1) / np.log(max_count + 1)
-global_stats['Sn'] = global_stats['avg_salary'] / 10
-global_stats['Dn'] = global_stats['avg_density'] / 10
-global_stats['Gn'] = global_stats['grade_num'] / 3  # Нормировка уровня квалификации
-global_stats['Cn'] = global_stats['avg_comp'] / 10
-
-# Считаем сырой коэффициент K_raw для всех комбинаций
-global_stats['k_raw'] = (
-        0.35 * global_stats['Nn'] +
-        0.25 * global_stats['Sn'] +
-        0.20 * global_stats['Dn'] +
-        0.05 * global_stats['Gn'] -
-        0.15 * global_stats['Cn']
-)
-
-# Находим глобальные минимумы и максимумы
-min_k = global_stats['k_raw'].min()
-max_k = global_stats['k_raw'].max()
-
-# Нормируем от 0 до 100
-if max_k == min_k:
-    global_stats['k_score'] = 100.0  # Защита от деления на ноль
-else:
-    global_stats['k_score'] = ((global_stats['k_raw'] - min_k) / (max_k - min_k)) * 100
-
-global_stats['k_score'] = global_stats['k_score'].round(2)
+df_exploded, global_stats = prepare_market_stats(df)
 
 # --------------------------------------------------------
 # SIDEBAR И ФИЛЬТРАЦИЯ ДЛЯ ВЫВОДА
@@ -332,10 +254,13 @@ if pd.notna(avg_real_salary) and avg_real_salary > 0:
     rounded_salary = int(round(avg_real_salary / 1000) * 1000)
     salary_display = f"{rounded_salary:,} ₽".replace(",", " ")
 else:
-    estimated_salary = int(30000 + (avg_salary - 1) * 45000)
-    estimated_salary = int(round(estimated_salary / 5000) * 5000)
-    salary_display = f"~ {estimated_salary:,} ₽ *".replace(",", " ")
-    is_estimated = True
+    estimated = estimate_hidden_salary(avg_salary, salary_calibration, market_median)
+    if estimated is None:
+        salary_display = "нет данных"
+    else:
+        rounded_est = int(round(estimated / 1000) * 1000)
+        salary_display = f"~ {rounded_est:,} ₽ *".replace(",", " ")
+        is_estimated = True
 
 # --------------------------------------------------------
 # ИНТЕРПРЕТАЦИЯ
@@ -377,7 +302,10 @@ c4.metric(
 )
 
 if is_estimated:
-    st.caption("* Работодатели скрыли зарплату. Сумма спрогнозирована ИИ на основе требований вакансий.")
+    st.caption(
+        "* Зарплата скрыта работодателями. Сумма оценена по рыночной калибровке: "
+        "медианы зарплат вакансий с раскрытой ЗП для каждой ИИ-оценки привлекательности."
+    )
 
 st.divider()
 
@@ -407,11 +335,9 @@ st.subheader("🛠 Наиболее востребованные навыки")
 
 skills = []
 for value in filtered["skills"].dropna():
-    if isinstance(value, str):
-        for skill in value.split(","):
-            skill = skill.strip()
-            if len(skill) > 1:
-                skills.append(skill)
+    for skill in extract_skills(value):
+        if len(skill) > 1:
+            skills.append(skill)
 
 counter = Counter(skills)
 top_skills = pd.DataFrame(
@@ -428,7 +354,7 @@ if not top_skills.empty:
         text="Количество"
     )
     fig.update_layout(height=500, yaxis={'categoryorder': 'total ascending'})
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 else:
     st.info("Навыки для выбранных параметров отсутствуют.")
 
@@ -464,7 +390,7 @@ if not clean_companies.empty:
         color_continuous_scale="Viridis"
     )
     fig.update_layout(showlegend=False, coloraxis_showscale=False)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 else:
     st.info("Данные о работодателях отсутствуют.")
 
@@ -504,7 +430,7 @@ table.columns = [
 
 st.dataframe(
     table,
-    use_container_width=True,
+    width='stretch',
     hide_index=True,
     column_config={
         "Ссылка": st.column_config.LinkColumn("Ссылка", display_text="Открыть на Хабре"),
