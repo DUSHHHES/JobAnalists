@@ -77,3 +77,6 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "10"))
 
 # Пауза между запросами к Оllama (в секундах)
 OLLAMA_DELAY = float(os.environ.get("OLLAMA_DELAY", "0.05"))
+
+# Пауза между запросами к страницам Хабра (в секундах)
+FETCH_DELAY = float(os.environ.get("FETCH_DELAY", "0.8"))

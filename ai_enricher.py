@@ -5,7 +5,7 @@
 import time
 import datetime
 
-from config import DEFAULT_AI_MODEL, MIN_DESCRIPTION_LENGTH, BATCH_SIZE, OLLAMA_DELAY
+from config import DEFAULT_AI_MODEL, MIN_DESCRIPTION_LENGTH, BATCH_SIZE, OLLAMA_DELAY, FETCH_DELAY
 from database import (
     init_db_schema, get_total_count,
     get_unprocessed_vacancies, save_batch_updates, update_vacancy_description
@@ -55,7 +55,7 @@ def run_ai_labeling(vacancies, model_name):
     for idx, (v_id, title, desc, link) in enumerate(vacancies, 1):
         if not desc or len(desc.strip()) < MIN_DESCRIPTION_LENGTH:
             print(f"[{idx}/{len(vacancies)}] ⚡ Докачиваю описание для: {title[:35]}...", end="", flush=True)
-            time.sleep(0.8)
+            time.sleep(FETCH_DELAY)
             desc = fetch_description_from_url(link)
 
             if desc and len(desc.strip()) >= MIN_DESCRIPTION_LENGTH:

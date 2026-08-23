@@ -18,6 +18,7 @@ from utils import (
     detect_technologies,
 )
 from ollama_client import parse_model_json
+from sync_pipeline import plan_sync_actions
 
 
 class TestExtractSkills(unittest.TestCase):
@@ -206,6 +207,50 @@ class TestDetectTechnologies(unittest.TestCase):
 
     def test_unknown_title_other(self):
         self.assertEqual(detect_technologies("Бухгалтер"), ["Other"])
+
+
+class TestPlanSyncActions(unittest.TestCase):
+
+    @staticmethod
+    def _card(v_id, title="Python разработчик", salary="100 000 руб"):
+        return {"id": v_id, "title": title, "salary": salary}
+
+    def test_new_card_detected(self):
+        new_cards, changed_cards = plan_sync_actions([self._card("1")], {})
+        self.assertEqual(len(new_cards), 1)
+        self.assertEqual(new_cards[0]["id"], "1")
+        self.assertEqual(changed_cards, [])
+
+    def test_unchanged_card_ignored(self):
+        existing = {"1": ("Python разработчик", "100 000 руб")}
+        new_cards, changed_cards = plan_sync_actions([self._card("1")], existing)
+        self.assertEqual((new_cards, changed_cards), ([], []))
+
+    def test_title_changed(self):
+        existing = {"1": ("Старый заголовок", "100 000 руб")}
+        new_cards, changed_cards = plan_sync_actions([self._card("1")], existing)
+        self.assertEqual(new_cards, [])
+        self.assertEqual(len(changed_cards), 1)
+
+    def test_salary_changed(self):
+        existing = {"1": ("Python разработчик", "100 000 руб")}
+        new_cards, changed_cards = plan_sync_actions(
+            [self._card("1", salary="200 000 руб")], existing
+        )
+        self.assertEqual(new_cards, [])
+        self.assertEqual(len(changed_cards), 1)
+
+    def test_both_changed_single_entry(self):
+        existing = {"1": ("Старый", "50 000 руб")}
+        new_cards, changed_cards = plan_sync_actions(
+            [self._card("1", title="Новый", salary="200 000 руб")], existing
+        )
+        self.assertEqual(new_cards, [])
+        self.assertEqual(len(changed_cards), 1)
+
+    def test_empty_cards_data(self):
+        new_cards, changed_cards = plan_sync_actions([], {"1": ("a", "b")})
+        self.assertEqual((new_cards, changed_cards), ([], []))
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from ollama_client import query_ollama, parse_model_json
 
 def get_judge_evaluation_ollama(title, description, model_name=JUDGE_MODEL):
     """
-    Отправляет вакансию независимой моделью-арбитру Qwen 2.5 7B через Ollama.
+    Отправляет вакансию независимой модели-арбитру через Ollama.
     Использует функцию query_ollama из ollama_client.py
     """
     system_prompt = """Ты — независимый эксперт-аудитор HR-данных. Проанализируй текст IT-вакансии.
@@ -57,7 +57,7 @@ def get_judge_evaluation_ollama(title, description, model_name=JUDGE_MODEL):
 
 def run_llm_cross_validation():
     print("==================================================================")
-    print("⚖️ ЗАПУСК КРОСС-ВАЛИДАЦИИ ДАННЫХ (Gemma 2 vs Qwen 2.5)")
+    print(f"⚖️ ЗАПУСК КРОСС-ВАЛИДАЦИИ ДАННЫХ (арбитр: {JUDGE_MODEL})")
     print("==================================================================\n")
 
     # 1. Проверяем доступность локального сервера Ollama
@@ -78,7 +78,7 @@ def run_llm_cross_validation():
     results = []
 
     for idx, row in enumerate(sample_df.itertuples(), 1):
-        print(f"[{idx}/{len(sample_df)}] Qwen 2.5 проверяет: {row.title[:45]}...", end="", flush=True)
+        print(f"[{idx}/{len(sample_df)}] {JUDGE_MODEL} проверяет: {row.title[:45]}...", end="", flush=True)
 
         judge_res = get_judge_evaluation_ollama(row.title, row.description)
 
@@ -91,12 +91,12 @@ def run_llm_cross_validation():
         results.append({
             "v_id": row.id,
             "title": row.title,
-            # Оценки основной модели (Gemma 2 из БД)
+            # Оценки основной модели (из БД)
             "m1_grade": row.ai_grade,
             "m1_salary": row.salary_score,
             "m1_density": row.requirements_density,
             "m1_comp": row.competition_score,
-            # Оценки Арбитра (Qwen 2.5 7B)
+            # Оценки арбитра
             "m2_grade": judge_res["ai_grade"],
             "m2_salary": judge_res["salary_score"],
             "m2_density": judge_res["requirements_density"],
@@ -106,7 +106,7 @@ def run_llm_cross_validation():
     eval_df = pd.DataFrame(results)
 
     if eval_df.empty:
-        print("\n❌ Не удалось получить ответы от модели Qwen 2.5.")
+        print("\n❌ Не удалось получить ответы от модели-арбитра.")
         return
 
     # --------------------------------------------------------------------------
@@ -141,7 +141,7 @@ def run_llm_cross_validation():
     if not mismatches.empty:
         print("🔍 Примеры спорных вакансий:")
         for r in mismatches.head(5).itertuples():
-            print(f"  • '{r.title}': Gemma = {r.m1_grade} | Qwen = {r.m2_grade}")
+            print(f"  • '{r.title}': основная = {r.m1_grade} | арбитр ({JUDGE_MODEL}) = {r.m2_grade}")
     else:
         print("🎉 Абсолютное 100% совпадение грейдов во всей выборке!")
 

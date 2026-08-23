@@ -4,8 +4,11 @@ import datetime
 import requests
 import bs4
 
-from config import DB_NAME, DEFAULT_AI_MODEL, SOFT_DELETE_THRESHOLD_DAYS, HABR_HEADERS, REQUEST_TIMEOUT
-from database import init_db_schema
+from config import (
+    DB_NAME, DEFAULT_AI_MODEL, SOFT_DELETE_THRESHOLD_DAYS,
+    HABR_HEADERS, REQUEST_TIMEOUT, FETCH_DELAY
+)
+from database import init_db_schema, get_unprocessed_vacancies
 from web_parser import fetch_description_from_url
 from ollama_client import select_model
 from ai_enricher import run_ai_labeling
@@ -106,6 +109,27 @@ def fetch_all_cards_from_site():
 
 # fetch_vacancy_description() теперь импортирована из web_parser.py как fetch_description_from_url
 
+def plan_sync_actions(cards_data, existing):
+    """
+    Сравнивает карточки сайта с текущим состоянием базы.
+
+    existing: dict {id: (title, salary)}.
+    Возвращает кортеж (new_cards, changed_cards) — новые вакансии и вакансии,
+    изменившие title или salary. Без обращений к БД и сети.
+    """
+    new_cards = []
+    changed_cards = []
+
+    for card in cards_data:
+        row = existing.get(card["id"])
+        if not row:
+            new_cards.append(card)
+        elif row[0] != card["title"] or row[1] != card["salary"]:
+            changed_cards.append(card)
+
+    return new_cards, changed_cards
+
+
 def sync_cards_with_db(cards_data):
     """
     Сравнивает список с сайта с базой SQLite:
@@ -125,51 +149,49 @@ def sync_cards_with_db(cards_data):
     cursor.execute("SELECT id, title, salary FROM vacancies")
     existing = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
 
-    for card in cards_data:
-        v_id = card["id"]
-        row = existing.get(v_id)
+    new_cards, changed_cards = plan_sync_actions(cards_data, existing)
+    planned_ids = {card["id"] for card in new_cards} | {card["id"] for card in changed_cards}
 
-        if not row:
-            # 1. Абсолютно новая вакансия
-            time.sleep(0.8)
-            desc = fetch_description_from_url(card["link"])
+    for card in new_cards:
+        time.sleep(FETCH_DELAY)
+        desc = fetch_description_from_url(card["link"])
 
-            cursor.execute("""
-                INSERT INTO vacancies 
-                (id, title, company, salary, experience, skills, description, link, first_seen, last_seen, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-            """, (v_id, card["title"], card["company"], card["salary"],
-                  card["experience"], card["skills"], desc, card["link"], today_str, today_str))
+        cursor.execute("""
+            INSERT INTO vacancies
+            (id, title, company, salary, experience, skills, description, link, first_seen, last_seen, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+        """, (card["id"], card["title"], card["company"], card["salary"],
+              card["experience"], card["skills"], desc, card["link"], today_str, today_str))
 
-            new_count += 1
-            print(f"  ✨ [НОВАЯ]: {card['title'][:45]}...")
+        new_count += 1
+        print(f"  ✨ [НОВАЯ]: {card['title'][:45]}...")
 
-        else:
-            old_title, old_salary = row
+    for card in changed_cards:
+        time.sleep(FETCH_DELAY)
+        desc = fetch_description_from_url(card["link"])
 
-            # 2. Проверка изменений в содержании
-            if old_title != card["title"] or old_salary != card["salary"]:
-                time.sleep(0.8)
-                desc = fetch_description_from_url(card["link"])
+        cursor.execute("""
+            UPDATE vacancies
+            SET title = ?, company = ?, salary = ?, experience = ?, skills = ?, description = ?,
+                last_seen = ?, status = 'active',
+                ai_grade = NULL, requirements_density = NULL, salary_score = NULL, competition_score = NULL,
+                ai_version = NULL, ai_processed_at = NULL
+            WHERE id = ?
+        """, (card["title"], card["company"], card["salary"], card["experience"],
+              card["skills"], desc, today_str, card["id"]))
 
-                cursor.execute("""
-                    UPDATE vacancies 
-                    SET title = ?, company = ?, salary = ?, experience = ?, skills = ?, description = ?,
-                        last_seen = ?, status = 'active', 
-                        ai_grade = NULL, requirements_density = NULL, salary_score = NULL, competition_score = NULL,
-                        ai_version = NULL, ai_processed_at = NULL
-                    WHERE id = ?
-                """, (card["title"], card["company"], card["salary"], card["experience"],
-                      card["skills"], desc, today_str, v_id))
+        updated_count += 1
+        print(f"  🔄 [ОБНОВЛЕНА]: {card['title'][:45]}... (Разметка ИИ сброшена)")
 
-                updated_count += 1
-                print(f"  🔄 [ОБНОВЛЕНА]: {card['title'][:45]}... (Разметка ИИ сброшена)")
-            else:
-                # 3. Вакансия без изменений — обновляем штамп активности
-                cursor.execute(
-                    "UPDATE vacancies SET last_seen = ?, status = 'active' WHERE id = ?",
-                    (today_str, v_id)
-                )
+    touched_rows = [
+        (today_str, card["id"])
+        for card in cards_data
+        if card["id"] not in planned_ids
+    ]
+    cursor.executemany(
+        "UPDATE vacancies SET last_seen = ?, status = 'active' WHERE id = ?",
+        touched_rows
+    )
 
     conn.commit()
     conn.close()
@@ -224,22 +246,7 @@ def run_ai_enrichment():
         print("\n⚠️ Сервер Ollama недоступен или нет моделей. Этап ИИ-анализа пропущен.")
         return
 
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-
-    # Выбираем вакансии, у которых отсутствует хотя бы один параметр разметки
-    cursor.execute("""
-        SELECT id, title, description, link 
-        FROM vacancies 
-        WHERE (ai_grade IS NULL 
-           OR salary_score IS NULL 
-           OR requirements_density IS NULL 
-           OR competition_score IS NULL
-           OR ai_grade IN ('ERROR', 'SKIP'))
-          AND status = 'active'
-    """)
-    unprocessed = cursor.fetchall()
-    conn.close()
+    unprocessed = get_unprocessed_vacancies(active_only=True)
 
     if not unprocessed:
         print("\n🤖 [ЭТАП 4/4] Все активные вакансии уже полностью размечены ИИ!")

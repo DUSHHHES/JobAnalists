@@ -94,7 +94,7 @@ def prepare_market_stats(df):
         avg_salary=('salary_score', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
         avg_density=('requirements_density', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
         avg_comp=('competition_score', lambda x: x.mean() if pd.notna(x.mean()) else 5.0),
-        avg_real_salary=('parsed_salary', lambda x: x.mean() if pd.notna(x.mean()) else np.nan),
+        avg_real_salary=('parsed_salary', lambda x: x.median() if pd.notna(x.median()) else np.nan),
         grade_num=('grade_num', 'first')
     ).reset_index()
 

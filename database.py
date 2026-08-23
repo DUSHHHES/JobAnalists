@@ -69,21 +69,27 @@ def get_total_count() -> int:
     return total_count
 
 
-def get_unprocessed_vacancies() -> List[Tuple]:
+def get_unprocessed_vacancies(active_only=False) -> List[Tuple]:
     """
     Возвращает список вакансий, которые требуют ИИ-разметки.
+
+    active_only=True ограничивает выборку вакансиями в статусе 'active'.
     """
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, title, description, link 
-        FROM vacancies 
-        WHERE ai_grade IS NULL 
-           OR salary_score IS NULL 
-           OR requirements_density IS NULL 
+    query = """
+        SELECT id, title, description, link
+        FROM vacancies
+        WHERE ai_grade IS NULL
+           OR salary_score IS NULL
+           OR requirements_density IS NULL
            OR competition_score IS NULL
            OR ai_grade IN ('ERROR', 'SKIP')
-    """)
+    """
+    if active_only:
+        query += "  AND status = 'active'"
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(query)
     vacancies = cursor.fetchall()
     conn.close()
     return vacancies
