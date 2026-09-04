@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 
-from config import OLLAMA_URL, JUDGE_MODEL, SAMPLE_SIZE, VALID_GRADES
+from config import OLLAMA_URL, JUDGE_MODEL, SAMPLE_SIZE, VALID_GRADES, MAX_DESCRIPTION_CHARS
 from database import get_annotated_sample
 from ollama_client import query_ollama, parse_model_json
 
@@ -29,7 +29,7 @@ def get_judge_evaluation_ollama(title, description, model_name=JUDGE_MODEL):
   "ai_grade": "Middle"
 }"""
 
-    short_desc = description[:5000] if description else ""
+    short_desc = description[:MAX_DESCRIPTION_CHARS] if description else ""
     user_content = f"Вакансия: {title}\nОписание:\n{short_desc}"
 
     raw_json = query_ollama(model_name, system_prompt, user_content)

@@ -2,7 +2,12 @@
 Модуль с утилитами для парсинга и обработки данных о вакансиях.
 """
 
+import os
 import re
+import sys
+import functools
+from contextlib import contextmanager
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -250,3 +255,55 @@ def clamp_score(value) -> int:
     except (TypeError, ValueError):
         return 5
     return max(SCORE_MIN, min(SCORE_MAX, value))
+
+
+class TeeStream:
+    """
+    Дублирует запись в исходный поток и в файл лога.
+    Безопасен к уже закрытому файлу.
+    """
+
+    def __init__(self, stream, file):
+        self._stream = stream
+        self._file = file
+
+    def write(self, data):
+        self._stream.write(data)
+        try:
+            self._file.write(data)
+        except ValueError:
+            pass
+        return len(data)
+
+    def flush(self):
+        self._stream.flush()
+        try:
+            self._file.flush()
+        except ValueError:
+            pass
+
+
+@contextmanager
+def file_log(directory="logs"):
+    """
+    На время блока дублирует stdout в logs/run_<timestamp>.log.
+    """
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, f"run_{datetime.now():%Y%m%d_%H%M%S}.log")
+    stream = open(path, "w", encoding="utf-8", errors="replace")
+    original = sys.stdout
+    sys.stdout = TeeStream(original, stream)
+    try:
+        yield path
+    finally:
+        sys.stdout = original
+        stream.close()
+
+
+def with_file_log(func):
+    """Пишет вывод функции одновременно в консоль и в файл лога."""
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        with file_log():
+            return func(*args, **kwargs)
+    return wrapper

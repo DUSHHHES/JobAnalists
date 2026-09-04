@@ -4,9 +4,15 @@
 Запуск: py -m unittest test_utils -v
 """
 
+import os
+import sqlite3
+import tempfile
 import unittest
 
 import pandas as pd
+
+import database
+from database import save_k_snapshots, get_k_history
 
 from utils import (
     calculate_relevance_score,
@@ -251,6 +257,44 @@ class TestPlanSyncActions(unittest.TestCase):
     def test_empty_cards_data(self):
         new_cards, changed_cards = plan_sync_actions([], {"1": ("a", "b")})
         self.assertEqual((new_cards, changed_cards), ([], []))
+
+
+class TestKSnapshots(unittest.TestCase):
+
+    def setUp(self):
+        self._old_db_name = database.DB_NAME
+        fd, self._tmp_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        database.DB_NAME = self._tmp_path
+
+    def tearDown(self):
+        database.DB_NAME = self._old_db_name
+        os.remove(self._tmp_path)
+
+    def test_roundtrip_ordered_by_date(self):
+        rows = [
+            ("2026-08-20", "Python", "Middle", 10, 55.5),
+            ("2026-08-21", "Python", "Middle", 12, 61.0),
+        ]
+        save_k_snapshots(rows)
+        history = get_k_history("Python", "Middle")
+        self.assertEqual(
+            history,
+            [("2026-08-20", 55.5), ("2026-08-21", 61.0)]
+        )
+
+    def test_upsert_same_day_replaces(self):
+        save_k_snapshots([("2026-08-20", "Go", "Senior", 5, 40.0)])
+        save_k_snapshots([("2026-08-20", "Go", "Senior", 7, 48.0)])
+        conn = sqlite3.connect(database.DB_NAME)
+        try:
+            count, k_score = conn.execute(
+                "SELECT COUNT(*), MAX(k_score) FROM k_snapshots"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(count, 1)
+        self.assertEqual(k_score, 48.0)
 
 
 if __name__ == "__main__":

@@ -5,14 +5,17 @@
 import time
 import datetime
 
-from config import DEFAULT_AI_MODEL, MIN_DESCRIPTION_LENGTH, BATCH_SIZE, OLLAMA_DELAY, FETCH_DELAY
+from config import (
+    DEFAULT_AI_MODEL, MIN_DESCRIPTION_LENGTH, BATCH_SIZE,
+    OLLAMA_DELAY, FETCH_DELAY, MAX_DESCRIPTION_CHARS
+)
 from database import (
     init_db_schema, get_total_count,
     get_unprocessed_vacancies, save_batch_updates, update_vacancy_description
 )
 from web_parser import fetch_description_from_url
-from ollama_client import check_ollama_server, select_model, query_ollama, parse_model_json
-from utils import clamp_score
+from ollama_client import check_ollama_server, select_model, query_llm, parse_model_json
+from utils import clamp_score, with_file_log
 from prompts import ENRICHMENT_PROMPT
 
 
@@ -20,10 +23,10 @@ def analyze_vacancy_with_ollama(title, description, active_model):
     """
     Отправляет вакансию в локальную Ollama с единым промптом из prompts.py.
     """
-    short_desc = description[:5000] if description else ""
+    short_desc = description[:MAX_DESCRIPTION_CHARS] if description else ""
     user_content = f"Название вакансии: {title}\nОписание вакансии:\n{short_desc}"
 
-    raw_json = query_ollama(active_model, ENRICHMENT_PROMPT, user_content, temperature=0.0)
+    raw_json = query_llm(active_model, ENRICHMENT_PROMPT, user_content, temperature=0.0)
 
     data = parse_model_json(raw_json)
     if data is None:
@@ -43,16 +46,28 @@ def analyze_vacancy_with_ollama(title, description, active_model):
 
 def run_ai_labeling(vacancies, model_name):
     """
-    Размечает ровно переданный список вакансий (v_id, title, desc, link).
+    Размечает ровно переданный список вакансий (v_id, title, desc, link,
+    last_seen).
 
     Автодокачивает описания, батчами пишет результаты через save_batch_updates.
     Фильтрацию по статусу/полноте выполняет вызывающий.
     """
     print(f"🚀 Запускаю разметку через Ollama ({model_name}). Осталось разметить: {len(vacancies)}")
 
+    today_str = datetime.date.today().isoformat()
+    fresh = sum(1 for row in vacancies if row[4] and row[4] >= today_str)
+    print(f"📊 В очереди: {len(vacancies)} шт. Из них видены сегодня: {fresh}, ранее: {len(vacancies)-fresh}")
+
+    started = time.monotonic()
+
     batch_updates = []
 
-    for idx, (v_id, title, desc, link) in enumerate(vacancies, 1):
+    for idx, (v_id, title, desc, link, last_seen) in enumerate(vacancies, 1):
+        processed = idx - 1
+        if processed and processed % 20 == 0:
+            remaining = (time.monotonic() - started) / processed * (len(vacancies) - processed)
+            print(f" ⏱ {processed}/{len(vacancies)} · осталось ≈ {remaining/60:.0f} мин", flush=True)
+
         if not desc or len(desc.strip()) < MIN_DESCRIPTION_LENGTH:
             print(f"[{idx}/{len(vacancies)}] ⚡ Докачиваю описание для: {title[:35]}...", end="", flush=True)
             time.sleep(FETCH_DELAY)
@@ -90,10 +105,15 @@ def run_ai_labeling(vacancies, model_name):
         print(f"\n💾 [СОХРАНЕНИЕ]: Последний батч ({len(batch_updates)}) зафиксирован в БД!")
 
 
+@with_file_log
 def enrich_data():
-    check_ollama_server()
+    from config import BACKEND
+    if BACKEND == "ollama":
+        check_ollama_server()
+        active_model = select_model(DEFAULT_AI_MODEL)
+    else:
+        active_model = "openvino"
 
-    active_model = select_model(DEFAULT_AI_MODEL)
     init_db_schema()
 
     total_count = get_total_count()

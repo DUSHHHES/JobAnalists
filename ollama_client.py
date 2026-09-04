@@ -9,7 +9,7 @@ import requests
 import sys
 from typing import Dict, List, Optional
 
-from config import OLLAMA_URL, DEFAULT_AI_MODEL, OLLAMA_TIMEOUT
+from config import OLLAMA_URL, DEFAULT_AI_MODEL, OLLAMA_TIMEOUT, OLLAMA_NUM_CTX, BACKEND
 
 
 def check_ollama_server() -> bool:
@@ -88,7 +88,7 @@ def query_ollama(model_name: str, system_prompt: str, user_content: str,
         ],
         "stream": False,
         "format": "json",
-        "options": {"temperature": temperature}
+        "options": {"temperature": temperature, "num_ctx": OLLAMA_NUM_CTX}
     }
     
     try:
@@ -138,3 +138,16 @@ def parse_model_json(raw_response) -> Optional[Dict]:
         return None
 
     return data if isinstance(data, dict) else None
+
+
+def query_llm(model_name: str, system_prompt: str, user_content: str,
+              temperature: float = 0.0) -> Optional[str]:
+    """
+    Универсальный запрос к LLM. Автоматически выбирает бэкенд
+    в зависимости от конфига BACKEND.
+    """
+    if BACKEND == "openvino_npu":
+        from openvino_client import query_openvino
+        return query_openvino(system_prompt, user_content, temperature)
+    else:
+        return query_ollama(model_name, system_prompt, user_content, temperature)

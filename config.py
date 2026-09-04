@@ -4,7 +4,8 @@
 """
 
 import os
-
+from dotenv import load_dotenv
+load_dotenv()
 # --------------------------------------------------------
 # Настройки базы данных
 # --------------------------------------------------------
@@ -37,6 +38,12 @@ HABR_HEADERS = {
 # Таймауты для HTTP-запросов (в секундах)
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "40"))
+MAX_DESCRIPTION_CHARS = int(os.environ.get("MAX_DESCRIPTION_CHARS", "9000"))
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
+
+BACKEND = os.environ.get("BACKEND", "ollama")
+OPENVINO_MODEL_DIR = os.environ.get("OPENVINO_MODEL_DIR", "models/qwen2.5-7b-int4")
+OPENVINO_DEVICE = os.environ.get("OPENVINO_DEVICE", "NPU")
 
 # Курсы валют для приведения зарплат к рублям
 USD_TO_RUB = float(os.environ.get("USD_TO_RUB", "90"))

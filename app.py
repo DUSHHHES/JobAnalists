@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import sqlite3
+import datetime
 from collections import Counter
 
 from utils import (
@@ -11,7 +13,7 @@ from utils import (
     build_salary_calibration,
     estimate_hidden_salary,
 )
-from database import get_connection
+from database import get_connection, save_k_snapshots, get_k_history
 
 # --------------------------------------------------------
 # НАСТРОЙКИ СТРАНИЦЫ
@@ -54,6 +56,7 @@ def load_data():
     WHERE
         ai_grade IN ('Junior','Middle','Senior')
         AND requirements_density IS NOT NULL
+        AND status = 'active'
     """
 
     df = pd.read_sql(query, conn)
@@ -131,6 +134,22 @@ def prepare_market_stats(df):
 
 
 df_exploded, global_stats = prepare_market_stats(df)
+
+try:
+    today_str = datetime.date.today().isoformat()
+    snapshot_rows = [
+        (
+            today_str,
+            row["technology"],
+            row["ai_grade"],
+            int(row["count"]),
+            float(row["k_score"]),
+        )
+        for _, row in global_stats.iterrows()
+    ]
+    save_k_snapshots(snapshot_rows)
+except sqlite3.Error as e:
+    st.warning(f"Не удалось сохранить снимок истории: {e}")
 
 # --------------------------------------------------------
 # SIDEBAR И ФИЛЬТРАЦИЯ ДЛЯ ВЫВОДА
@@ -227,6 +246,18 @@ st.info(
     f"🎓 **Хочешь прокачаться?** Посмотри [пошаговый Roadmap "
     f"(карту развития) для {technology}]({roadmap_url})"
 )
+
+with st.expander("📈 История коэффициента"):
+    history = get_k_history(technology, grade)
+    if len(history) >= 2:
+        history_df = pd.DataFrame(history, columns=["Дата", "Коэффициент"])
+        history_fig = px.line(history_df, x="Дата", y="Коэффициент", markers=True)
+        st.plotly_chart(history_fig, width='stretch')
+    else:
+        st.caption(
+            "История накапливается автоматически: снимок создаётся "
+            "при каждом открытии дашборда."
+        )
 
 # --------------------------------------------------------
 # ИЗВЛЕЧЕНИЕ РАССЧИТАННЫХ ДАННЫХ

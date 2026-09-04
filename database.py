@@ -10,8 +10,14 @@ from config import DB_NAME
 
 
 def get_connection() -> sqlite3.Connection:
-    """Возвращает подключение к базе данных."""
-    return sqlite3.connect(DB_NAME)
+    """
+    Возвращает подключение к базе данных в WAL-режиме
+    с таймаутом ожидания блокировки.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout = 3000")
+    return conn
 
 
 def init_db_schema():
@@ -55,6 +61,11 @@ def init_db_schema():
         except sqlite3.OperationalError:
             pass  # Колонка уже существует
 
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_vacancies_status_last_seen
+        ON vacancies(status, last_seen)
+    """)
+
     conn.commit()
     conn.close()
 
@@ -76,7 +87,7 @@ def get_unprocessed_vacancies(active_only=False) -> List[Tuple]:
     active_only=True ограничивает выборку вакансиями в статусе 'active'.
     """
     query = """
-        SELECT id, title, description, link
+        SELECT id, title, description, link, last_seen
         FROM vacancies
         WHERE ai_grade IS NULL
            OR salary_score IS NULL
@@ -86,6 +97,7 @@ def get_unprocessed_vacancies(active_only=False) -> List[Tuple]:
     """
     if active_only:
         query += "  AND status = 'active'"
+    query += "  ORDER BY last_seen DESC"
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -228,3 +240,55 @@ def get_annotated_sample(sample_size: int = 30):
     actual_sample_size = min(sample_size, len(df))
     sample_df = df.sample(n=actual_sample_size, random_state=42).copy()
     return sample_df
+
+
+def save_k_snapshots(rows):
+    """
+    Сохраняет дневные снимки коэффициента востребованности.
+
+    rows: iterable кортежей (snapshot_date, technology, ai_grade,
+    vacancies_count, k_score). Повторный снимок той же пары
+    технология/грейд за ту же дату заменяет прежнее значение.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS k_snapshots (
+            snapshot_date TEXT,
+            technology TEXT,
+            ai_grade TEXT,
+            vacancies_count INTEGER,
+            k_score REAL,
+            PRIMARY KEY (snapshot_date, technology, ai_grade)
+        )
+    """)
+    cursor.executemany(
+        "INSERT OR REPLACE INTO k_snapshots VALUES (?, ?, ?, ?, ?)",
+        list(rows)
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_k_history(technology, ai_grade):
+    """
+    Возвращает историю коэффициента по паре технология/грейд
+    как список кортежей (snapshot_date, k_score), упорядоченный по дате.
+    Если таблица ещё не создана, возвращает пустой список.
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT snapshot_date, k_score FROM k_snapshots "
+            "WHERE technology = ? AND ai_grade = ? "
+            "ORDER BY snapshot_date",
+            (technology, ai_grade)
+        )
+        history = cursor.fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+    return history

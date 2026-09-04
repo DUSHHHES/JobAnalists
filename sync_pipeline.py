@@ -12,6 +12,7 @@ from database import init_db_schema, get_unprocessed_vacancies
 from web_parser import fetch_description_from_url
 from ollama_client import select_model
 from ai_enricher import run_ai_labeling
+from utils import with_file_log
 
 
 # --------------------------------------------------------------------------
@@ -40,9 +41,16 @@ def fetch_all_cards_from_site():
     while True:
         url = f"https://career.habr.com/vacancies?type=all&page={page}"
         try:
-            response = requests.get(url, headers=HABR_HEADERS, timeout=REQUEST_TIMEOUT)
-            if response.status_code != 200:
-                print(f"⚠️ Ответ сервера {response.status_code} на странице {page}. Остановка скана.")
+            response = None
+            for attempt in range(3):
+                response = requests.get(url, headers=HABR_HEADERS, timeout=REQUEST_TIMEOUT)
+                if response.status_code == 200:
+                    break
+                if attempt < 2:
+                    time.sleep(FETCH_DELAY)
+            if response is None or response.status_code != 200:
+                code = response.status_code if response is not None else 0
+                print(f"⚠️ Страница {page}: сервер ответил {code} после повторов. Возможен лимит/блокировка. Остановка скана.")
                 break
 
             soup = bs4.BeautifulSoup(response.text, "html.parser")
@@ -93,7 +101,7 @@ def fetch_all_cards_from_site():
 
             page += 1
 
-        except Exception as e:
+        except requests.RequestException as e:
             print(f"⚠️ Ошибка сети при сканировании страницы {page}: {e}")
             break
 
@@ -236,15 +244,18 @@ def apply_soft_delete(days_threshold=14):
 
 def run_ai_enrichment():
     """
-    Размечает вакансии через Ollama с автодокачкой описаний при необходимости,
+    Размечает вакансии через Ollama/OpenVINO с автодокачкой описаний при необходимости,
     записывая ai_version и ai_processed_at.
     """
-    # Проверка доступности Ollama
-    try:
-        model_name = select_model(DEFAULT_AI_MODEL)
-    except SystemExit:
-        print("\n⚠️ Сервер Ollama недоступен или нет моделей. Этап ИИ-анализа пропущен.")
-        return
+    from config import BACKEND
+    if BACKEND == "ollama":
+        try:
+            model_name = select_model(DEFAULT_AI_MODEL)
+        except SystemExit:
+            print("\n⚠️ Сервер Ollama недоступен или нет моделей. Этап ИИ-анализа пропущен.")
+            return
+    else:
+        model_name = "openvino"
 
     unprocessed = get_unprocessed_vacancies(active_only=True)
 
@@ -283,6 +294,7 @@ def print_db_summary():
             print(f"     - {ver}: {cnt} шт.")
 
 
+@with_file_log
 def update_database():
     print("==================================================================")
     print("🚀 ЕДИНЫЙ ПАЙПЛАЙН СИНХРОНИЗАЦИИ И АНАЛИЗА БАЗЫ ДАННЫХ")
