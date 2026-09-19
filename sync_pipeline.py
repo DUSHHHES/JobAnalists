@@ -6,12 +6,14 @@ import bs4
 
 from config import (
     DB_NAME, DEFAULT_AI_MODEL, SOFT_DELETE_THRESHOLD_DAYS,
-    HABR_HEADERS, REQUEST_TIMEOUT, FETCH_DELAY
+    HABR_HEADERS, REQUEST_TIMEOUT, FETCH_DELAY,
+    HH_MAX_PAGES, HH_AREAS
 )
 from database import init_db_schema, get_unprocessed_vacancies
 from web_parser import fetch_description_from_url
 from ollama_client import select_model
 from ai_enricher import run_ai_labeling
+from hh_scraper import fetch_all_it_vacancies
 from utils import with_file_log
 
 
@@ -144,23 +146,33 @@ def sync_cards_with_db(cards_data):
     - Обновляет last_seen = today и status = 'active'.
     - Загружает описание только для новых вакансий.
     - Если заголовок или ЗП изменились у старой вакансии — сбрасывает разметку ИИ для повторного анализа.
+    - Дедупликация по company+title (нормализованная).
     """
     today_str = datetime.date.today().isoformat()
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
 
-    print("\n💾 [ЭТАП 2/4] Синхронизация данных с SQLite...")
+    print("\n  [ЭТАП 2/4] Синхронизация данных с SQLite...")
 
     new_count = 0
     updated_count = 0
+    skipped_dup = 0
 
     cursor.execute("SELECT id, title, salary FROM vacancies")
     existing = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+    cursor.execute("SELECT LOWER(TRIM(company)), LOWER(TRIM(title)) FROM vacancies")
+    existing_pairs = {(row[0], row[1]) for row in cursor.fetchall()}
 
     new_cards, changed_cards = plan_sync_actions(cards_data, existing)
     planned_ids = {card["id"] for card in new_cards} | {card["id"] for card in changed_cards}
 
     for card in new_cards:
+        pair = (card["company"].lower().strip(), card["title"].lower().strip())
+        if pair in existing_pairs:
+            skipped_dup += 1
+            continue
+
         time.sleep(FETCH_DELAY)
         desc = fetch_description_from_url(card["link"])
 
@@ -171,8 +183,9 @@ def sync_cards_with_db(cards_data):
         """, (card["id"], card["title"], card["company"], card["salary"],
               card["experience"], card["skills"], desc, card["link"], today_str, today_str))
 
+        existing_pairs.add(pair)
         new_count += 1
-        print(f"  ✨ [НОВАЯ]: {card['title'][:45]}...")
+        print(f"  [НОВАЯ]: {card['title'][:45]}...")
 
     for card in changed_cards:
         time.sleep(FETCH_DELAY)
@@ -189,7 +202,7 @@ def sync_cards_with_db(cards_data):
               card["skills"], desc, today_str, card["id"]))
 
         updated_count += 1
-        print(f"  🔄 [ОБНОВЛЕНА]: {card['title'][:45]}... (Разметка ИИ сброшена)")
+        print(f"  [ОБНОВЛЕНА]: {card['title'][:45]}... (Сброс AI-разметки)")
 
     touched_rows = [
         (today_str, card["id"])
@@ -203,7 +216,7 @@ def sync_cards_with_db(cards_data):
 
     conn.commit()
     conn.close()
-    print(f"✅ Добавлено новых: {new_count} шт. Обновлено существующих: {updated_count} шт.")
+    print(f"  Новых: {new_count} | Обновлено: {updated_count} | Пропущено (дубли): {skipped_dup}")
 
 
 # --------------------------------------------------------------------------
@@ -297,21 +310,27 @@ def print_db_summary():
 @with_file_log
 def update_database():
     print("==================================================================")
-    print("🚀 ЕДИНЫЙ ПАЙПЛАЙН СИНХРОНИЗАЦИИ И АНАЛИЗА БАЗЫ ДАННЫХ")
+    print("  ЕДИНЫЙ ПАЙПЛАЙН: СИНХРОНИЗАЦИЯ И АНАЛИЗ БАЗЫ ДАННЫХ")
     print("==================================================================\n")
 
     init_db_schema()
-    cards = fetch_all_cards_from_site()
 
+    print("1. [ЭТАП 1/4] Сканирование Habr Career...")
+    cards = fetch_all_cards_from_site()
     if cards:
         sync_cards_with_db(cards)
+
+    print("\n2. [ЭТАП 2/4] Сканирование HH.ru...")
+    hh_cards = fetch_all_it_vacancies("", HH_AREAS, HH_MAX_PAGES)
+    if hh_cards:
+        sync_cards_with_db(hh_cards)
 
     apply_soft_delete(days_threshold=SOFT_DELETE_THRESHOLD_DAYS)
     run_ai_enrichment()
     print_db_summary()
 
     print("\n==================================================================")
-    print("✨ ПАЙПЛАЙН УСПЕШНО ВЫПОЛНЕН! БАЗА ДАННЫХ В АКТУАЛЬНОМ СОСТОЯНИИ.")
+    print("  ПАЙПЛАЙН УСПЕШНО ВЫПОЛНЕН!")
     print("==================================================================\n")
 
 

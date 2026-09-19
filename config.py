@@ -43,7 +43,10 @@ OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "8192"))
 
 BACKEND = os.environ.get("BACKEND", "ollama")
 OPENVINO_MODEL_DIR = os.environ.get("OPENVINO_MODEL_DIR", "models/qwen2.5-7b-int4")
-OPENVINO_DEVICE = os.environ.get("OPENVINO_DEVICE", "NPU")
+OPENVINO_DEVICE = os.environ.get("OPENVINO_DEVICE", "CPU")
+
+HH_MAX_PAGES = int(os.environ.get("HH_MAX_PAGES", "10"))
+HH_AREAS = [int(a.strip()) for a in os.environ.get("HH_AREAS", "1,2").split(",")]
 
 # Курсы валют для приведения зарплат к рублям
 USD_TO_RUB = float(os.environ.get("USD_TO_RUB", "90"))
